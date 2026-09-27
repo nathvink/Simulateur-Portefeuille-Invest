@@ -1,0 +1,2293 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simulateur de portefeuille</title>
+
+<script>
+/* =============================================================================
+   SIMULATEUR DE PORTEFEUILLE D'INVESTISSEMENT — fichier autonome
+   -----------------------------------------------------------------------------
+   Ouvrez simplement ce fichier dans un navigateur : aucun serveur, aucune clé
+   d'API. Seuls Chart.js (graphiques) et la police Inter sont chargés depuis
+   un CDN. Rien n'est sauvegardé : la configuration ci-dessous est rechargée
+   à chaque ouverture.
+
+   Organisation du fichier :
+     1. CONFIGURATION MODIFIABLE  (ce bloc) : portefeuille, fiscalité, hypothèses
+     2. Styles (CSS)
+     3. Structure de la page (HTML)
+     4. DONNEES_MARCHE : séries historiques annuelles 1990-2025 + crises
+     5. Moteur de calcul (fonctions pures, aussi exécutées dans un Web Worker)
+     6. Fiscalité (fonctions pures)
+     7. Interface (affichage, graphiques, événements)
+   ============================================================================= */
+
+/* -----------------------------------------------------------------------------
+   1a. PORTEFEUILLE_PAR_DEFAUT — modifiez-le librement
+   - actif      : identifiant d'un actif de DONNEES_MARCHE.actifs, par exemple
+                  'MSCI_WORLD', 'SP500', 'CAC40', 'EUROSTOXX50', 'MSCI_EM',
+                  'OBLIG_ETAT_EUR', 'OBLIG_ENTREPRISE_EUR', 'FONDS_EUROS',
+                  'SCPI', 'REIT_MONDE', 'OR', 'MATIERES_PREMIERES'
+   - valeur     : un pourcentage si modeSaisie = 'pourcentage',
+                  un montant en euros si modeSaisie = 'montant'
+   - enveloppe  : 'PEA', 'CTO' (compte-titres) ou 'AV' (assurance-vie)
+   ----------------------------------------------------------------------------- */
+const PORTEFEUILLE_PAR_DEFAUT = {
+  modeSaisie: 'pourcentage',        // 'pourcentage' ou 'montant'
+  capitalDepart: 10000,             // € (ignoré en mode 'montant' : c'est la somme des lignes)
+  versementMensuel: 200,            // € par mois
+  hausseAnnuelleVersement: 2,       // % d'augmentation des versements chaque année
+  horizonAnnees: 20,                // 1 à 40 ans
+  reequilibrageAnnuel: true,        // retour aux proportions cibles une fois par an
+
+  lignes: [
+    { actif: 'MSCI_WORLD',  valeur: 55, enveloppe: 'PEA' },
+    { actif: 'MSCI_EM',     valeur: 10, enveloppe: 'PEA' },
+    { actif: 'EUROSTOXX50', valeur: 10, enveloppe: 'PEA' },
+    { actif: 'FONDS_EUROS', valeur: 20, enveloppe: 'AV'  },
+    { actif: 'OR',          valeur: 5,  enveloppe: 'CTO' },
+  ],
+
+  historique: { anneeDebut: 2000, anneeFin: 2025, reference: 'MSCI_WORLD' },
+  projection: { nombreScenarios: 5000, longueurBloc: 5, graine: 2025 },
+  fiscalite:  { situation: 'celibataire', anciennetePEA: 0, ancienneteAV: 0 },
+};
+
+/* -----------------------------------------------------------------------------
+   1b. PARAMETRES_FISCAUX
+   ⚠️  À VÉRIFIER AVANT TOUTE DÉCISION : ces taux et plafonds changent avec les
+   lois de finances (LF) et de financement de la Sécurité sociale (LFSS).
+   Consultez impots.gouv.fr ou service-public.fr pour les valeurs en vigueur.
+   Valeurs saisies en 2026 :
+   - La LFSS 2026 a relevé la CSG sur les revenus du capital : prélèvements
+     sociaux de 18,6 % (au lieu de 17,2 %) pour le PEA et le CTO, soit un PFU
+     de 31,4 %. L'assurance-vie resterait à 17,2 %. Vérifiez ce point.
+   ----------------------------------------------------------------------------- */
+const PARAMETRES_FISCAUX = {
+  pfuImpotRevenu: 0.128,                    // part « impôt sur le revenu » du prélèvement forfaitaire unique
+  prelevementsSociaux: 0.186,               // PEA et CTO (17,2 % avant 2026)
+  prelevementsSociauxAssuranceVie: 0.172,   // assurance-vie
+  pea: {
+    plafondVersements: 150000,              // € de versements cumulés maximum
+    dureeExoneration: 5,                    // années avant exonération d'impôt sur le revenu
+  },
+  assuranceVie: {
+    dureeAvantage: 8,                       // années avant le régime favorable
+    abattementCelibataire: 4600,            // € de gains exonérés d'impôt sur le revenu par an
+    abattementCouple: 9200,
+    tauxReduitApres8Ans: 0.075,             // IR après 8 ans (versements jusqu'au seuil)
+    seuilVersements: 150000,                // au-delà : 12,8 % sur la fraction correspondante
+  },
+};
+
+/* -----------------------------------------------------------------------------
+   1c. HYPOTHESES de simulation (frais, inflation)
+   ----------------------------------------------------------------------------- */
+const HYPOTHESES = {
+  fraisGestionAssuranceVieUC: 0.6,  // %/an prélevés par l'assureur sur les unités de compte (hors fonds euros)
+  inflationAnnuelle: 2.0,           // %/an, pour traduire les montants futurs en « euros d'aujourd'hui »
+};
+</script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+<!-- ===========================================================================
+     2. STYLES
+     =========================================================================== -->
+<style>
+  :root {
+    --fond: #f4f5f9;
+    --carte: #ffffff;
+    --texte: #0f172a;
+    --texte-2: #475569;
+    --muet: #8a8f9c;
+    --bord: rgba(15, 23, 42, 0.08);
+    --grille: #eef0f4;
+    --accent: #2a78d6;
+    --accent-fonce: #1c5cab;
+    --accent-doux: #e9f1fc;
+    --gain: #0a8a4a;
+    --gain-doux: #e7f6ee;
+    --perte: #d03b3b;
+    --perte-doux: #fdeeee;
+    --alerte: #a15c00;
+    --alerte-doux: #fff5e3;
+    --rayon: 20px;
+    --ombre: 0 1px 2px rgba(15, 23, 42, 0.04), 0 8px 28px rgba(15, 23, 42, 0.05);
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    background: var(--fond);
+    color: var(--texte);
+    font-size: 15px;
+    line-height: 1.5;
+  }
+  h1, h2, h3 { margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 18px; font-weight: 700; }
+  h3 { font-size: 15px; font-weight: 600; }
+  p { margin: 0; }
+  button, input, select { font: inherit; color: inherit; }
+
+  .conteneur { max-width: 1200px; margin: 0 auto; padding: 28px 16px 96px; }
+
+  /* ---- En-tête ---- */
+  .entete { display: flex; align-items: center; gap: 14px; margin-bottom: 24px; }
+  .logo {
+    width: 44px; height: 44px; border-radius: 14px; flex: none;
+    background: linear-gradient(135deg, var(--accent), #5aa0ef);
+    display: grid; place-items: center; color: #fff; font-weight: 800; font-size: 20px;
+  }
+  .entete h1 { font-size: 22px; font-weight: 800; }
+  .entete p { color: var(--texte-2); font-size: 14px; }
+
+  /* ---- Cartes ---- */
+  .carte {
+    background: var(--carte); border-radius: var(--rayon); padding: 24px;
+    border: 1px solid var(--bord); box-shadow: var(--ombre); min-width: 0;
+  }
+  .carte > h2 { margin-bottom: 4px; }
+  .carte > .sous-titre { color: var(--texte-2); font-size: 14px; margin-bottom: 18px; }
+  .pile { display: grid; gap: 16px; }
+  .grille { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .grille-param { grid-template-columns: minmax(280px, 1fr) minmax(300px, 2fr); }
+  @media (max-width: 860px) { .grille-param { grid-template-columns: 1fr; } }
+
+  /* ---- Résumé ---- */
+  .resume { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); margin-bottom: 20px; }
+  .tuile { padding: 20px 22px; }
+  .tuile .etiquette { display: flex; align-items: center; gap: 6px; color: var(--texte-2); font-size: 13px; font-weight: 500; }
+  .tuile strong { display: block; font-size: 26px; font-weight: 700; letter-spacing: -0.02em; margin: 6px 0 2px; white-space: nowrap; }
+  .tuile .sous { color: var(--muet); font-size: 13px; }
+
+  /* ---- Onglets ---- */
+  .onglets {
+    display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none;
+    background: var(--carte); border: 1px solid var(--bord); border-radius: 999px;
+    padding: 5px; margin-bottom: 20px; position: sticky; top: 8px; z-index: 30; box-shadow: var(--ombre);
+  }
+  .onglets::-webkit-scrollbar { display: none; }
+  .onglet {
+    border: 0; background: transparent; padding: 9px 16px; border-radius: 999px;
+    font-weight: 600; font-size: 14px; color: var(--texte-2); white-space: nowrap; cursor: pointer;
+  }
+  .onglet:hover { background: var(--fond); }
+  .onglet[aria-selected="true"] { background: var(--texte); color: #fff; }
+  .panneau[hidden] { display: none; }
+
+  /* ---- Formulaires ---- */
+  .champ { display: grid; gap: 6px; margin-bottom: 16px; min-width: 0; }
+  .champ > span, .libelle { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: var(--texte-2); }
+  input[type="number"], select {
+    width: 100%; padding: 10px 12px; border-radius: 12px; border: 1px solid #dfe3ea;
+    background: #fbfcfd; font-size: 15px; min-width: 0;
+  }
+  input[type="number"]:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+  input:disabled { color: var(--muet); background: #f1f3f6; }
+  .suffixe { position: relative; }
+  .suffixe input { padding-right: 34px; }
+  .suffixe em { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); font-style: normal; color: var(--muet); pointer-events: none; }
+  input[type="range"] { width: 100%; accent-color: var(--accent); }
+  .valeur-curseur { font-weight: 700; color: var(--texte); }
+
+  .segment { display: inline-flex; justify-self: start; background: var(--fond); border-radius: 12px; padding: 4px; gap: 2px; flex-wrap: wrap; }
+  .segment label { cursor: pointer; }
+  .segment input { position: absolute; opacity: 0; pointer-events: none; }
+  .segment span { display: block; padding: 7px 14px; border-radius: 9px; font-size: 14px; font-weight: 600; color: var(--texte-2); }
+  .segment input:checked + span { background: #fff; color: var(--texte); box-shadow: 0 1px 3px rgba(15,23,42,.12); }
+  .segment input:focus-visible + span { outline: 2px solid var(--accent); }
+
+  .interrupteur { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 14px; font-weight: 600; color: var(--texte-2); }
+  .interrupteur input { appearance: none; -webkit-appearance: none; width: 42px; height: 24px; border-radius: 999px; background: #d5dae2; position: relative; cursor: pointer; transition: background .2s; flex: none; margin: 0; }
+  .interrupteur input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .2s; box-shadow: 0 1px 2px rgba(0,0,0,.2); }
+  .interrupteur input:checked { background: var(--accent); }
+  .interrupteur input:checked::after { transform: translateX(18px); }
+  .interrupteur input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .bouton {
+    border: 0; border-radius: 12px; padding: 10px 16px; font-weight: 600; cursor: pointer;
+    background: var(--accent-doux); color: var(--accent-fonce);
+  }
+  .bouton:hover { background: #dbe8fa; }
+
+  /* ---- Lignes du portefeuille ---- */
+  .ligne { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(0, 1fr) minmax(0, 1.1fr) 40px; gap: 12px; align-items: end; padding: 14px 0; border-bottom: 1px solid var(--bord); }
+  .ligne .champ { margin: 0; }
+  .ligne .msg { grid-column: 1 / -1; }
+  .btn-suppr { width: 40px; height: 42px; border-radius: 12px; border: 1px solid #e3e6ec; background: #fff; cursor: pointer; font-size: 20px; color: var(--muet); }
+  .btn-suppr:hover { color: var(--perte); border-color: var(--perte); }
+  @media (max-width: 640px) {
+    .ligne { grid-template-columns: minmax(0,1fr) minmax(0,1fr) 40px; }
+    .ligne .champ-actif { grid-column: 1 / -1; }
+  }
+  .pied-lignes { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 16px; flex-wrap: wrap; }
+  .total-lignes { font-weight: 600; }
+
+  /* ---- Messages ---- */
+  .msg { font-size: 13px; padding: 8px 12px; border-radius: 10px; line-height: 1.45; }
+  .msg.erreur { background: var(--perte-doux); color: #9b2323; }
+  .msg.attention { background: var(--alerte-doux); color: var(--alerte); }
+  .msg.info { background: var(--accent-doux); color: var(--accent-fonce); }
+  .msg + .msg { margin-top: 8px; }
+  .note { font-size: 13px; color: var(--muet); margin-top: 10px; }
+
+  /* ---- Bulles d'aide « ? » ---- */
+  .aide {
+    display: inline-grid; place-items: center; flex: none;
+    width: 17px; height: 17px; border-radius: 50%; padding: 0;
+    border: 1px solid #c9ced8; background: #fff; color: var(--texte-2);
+    font-size: 11px; font-weight: 700; line-height: 1; cursor: help; vertical-align: middle;
+  }
+  .aide:hover, .aide:focus-visible { border-color: var(--accent); color: var(--accent); outline: none; }
+  #bulle {
+    position: fixed; z-index: 1000; max-width: 300px; padding: 10px 13px; border-radius: 12px;
+    background: #0f172a; color: #f1f5f9; font-size: 13px; line-height: 1.5; font-weight: 400;
+    box-shadow: 0 10px 30px rgba(15,23,42,.25); pointer-events: none; opacity: 0; transition: opacity .12s;
+  }
+  #bulle.visible { opacity: 1; }
+
+  /* ---- Graphiques ---- */
+  .graph { position: relative; height: 320px; }
+  .graph.petit { height: 260px; }
+  .graph.haut { height: 380px; }
+  @media (max-width: 640px) { .graph { height: 280px; } .graph.haut { height: 320px; } }
+  .sans-graph { display: grid; place-items: center; height: 100%; color: var(--muet); font-size: 14px; text-align: center; padding: 16px; }
+  .chargement {
+    position: absolute; inset: 0; display: none; place-items: center; background: rgba(255,255,255,.7);
+    border-radius: 12px; z-index: 5; font-size: 14px; font-weight: 600; color: var(--texte-2);
+  }
+  .chargement.actif { display: grid; }
+  .spinner { width: 28px; height: 28px; border-radius: 50%; border: 3px solid var(--accent-doux); border-top-color: var(--accent); animation: tourne .8s linear infinite; margin: 0 auto 8px; }
+  @keyframes tourne { to { transform: rotate(360deg); } }
+  .mini-spinner { display: inline-block; width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--accent-doux); border-top-color: var(--accent); animation: tourne .8s linear infinite; vertical-align: -2px; }
+
+  .controles { display: flex; gap: 16px; flex-wrap: wrap; align-items: end; margin-bottom: 18px; }
+  .controles .champ { margin: 0; min-width: 130px; flex: 1 1 130px; }
+  .controles .interrupteur { padding-bottom: 10px; }
+
+  /* ---- Indicateurs ---- */
+  .kpis { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+  .kpi { background: var(--fond); border-radius: 14px; padding: 14px 16px; }
+  .kpi .libelle { font-weight: 500; }
+  .kpi strong { display: block; font-size: 19px; font-weight: 700; margin-top: 4px; overflow-wrap: anywhere; }
+  .kpi small { color: var(--muet); font-size: 12px; }
+  .positif { color: var(--gain); }
+  .negatif { color: var(--perte); }
+
+  .indicateur { display: grid; gap: 8px; }
+  .indicateur .valeurs { display: flex; gap: 20px; align-items: baseline; flex-wrap: wrap; }
+  .indicateur .valeurs strong { font-size: 28px; font-weight: 700; letter-spacing: -0.02em; }
+  .indicateur .ref { color: var(--muet); font-size: 13px; }
+  .indicateur .phrase { color: var(--texte-2); font-size: 14px; }
+
+  /* ---- Scénarios ---- */
+  .scenario { border-top: 4px solid var(--muet); }
+  .scenario.pessimiste { border-top-color: #eb6834; }
+  .scenario.median { border-top-color: var(--accent); }
+  .scenario.optimiste { border-top-color: #1baf7a; }
+  .scenario .montant { font-size: 28px; font-weight: 700; letter-spacing: -0.02em; margin: 6px 0 12px; }
+  .lignes-chiffres { display: grid; gap: 6px; font-size: 14px; }
+  .lignes-chiffres div { display: flex; justify-content: space-between; gap: 12px; }
+  .lignes-chiffres span:first-child { color: var(--texte-2); }
+  .lignes-chiffres .sep { border-top: 1px solid var(--bord); padding-top: 6px; margin-top: 2px; font-weight: 600; }
+  .phrases { display: grid; gap: 10px; }
+  .phrases li { font-size: 15px; }
+  .phrases { padding-left: 20px; margin: 0; }
+
+  /* ---- Crises ---- */
+  .crise h3 { margin-bottom: 2px; }
+  .crise .periode { color: var(--muet); font-size: 13px; margin-bottom: 12px; }
+  .crise .repere { font-size: 13px; color: var(--texte-2); margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--bord); }
+
+  /* ---- Tableaux ---- */
+  .table-defil { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 12px; border: 1px solid var(--bord); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--bord); vertical-align: top; }
+  th { background: #f8f9fb; font-weight: 600; color: var(--texte-2); white-space: nowrap; }
+  td.nombre, th.nombre { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  td.approx { background: var(--alerte-doux); color: var(--alerte); }
+  .table-donnees td, .table-donnees th { padding: 6px 9px; }
+  .table-donnees th:first-child, .table-donnees td:first-child { position: sticky; left: 0; background: #f8f9fb; z-index: 1; }
+  .ok { color: var(--gain); font-weight: 700; }
+  .ko { color: var(--perte); font-weight: 700; }
+  .tfisc td:first-child { color: var(--texte-2); }
+  .tfisc tr.total td { font-weight: 700; color: var(--texte); background: #f8f9fb; }
+
+  .regimes { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .regime { background: var(--fond); border-radius: 14px; padding: 16px; font-size: 14px; }
+  .regime h3 { margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
+  .regime ul { margin: 6px 0 0; padding-left: 18px; color: var(--texte-2); }
+
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; background: var(--fond); padding: 1px 5px; border-radius: 6px; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 12px; overflow-x: auto; font-size: 12.5px; line-height: 1.5; }
+
+  /* ---- Avertissement permanent ---- */
+  .avertissement-bas {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+    background: rgba(255,255,255,.94); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    border-top: 1px solid var(--bord); text-align: center; font-size: 12px; color: var(--muet); padding: 8px 16px;
+  }
+</style>
+</head>
+
+<body>
+<!-- ===========================================================================
+     3. STRUCTURE DE LA PAGE
+     =========================================================================== -->
+<div class="conteneur">
+
+  <header class="entete">
+    <div class="logo" aria-hidden="true">€</div>
+    <div>
+      <h1>Simulateur de portefeuille</h1>
+      <p>Construisez votre portefeuille, rejouez l'histoire et projetez-vous — en euros, avec la fiscalité française.</p>
+    </div>
+  </header>
+
+  <!-- Cartes résumé -->
+  <section class="resume" aria-label="Résumé">
+    <div class="carte tuile">
+      <span class="etiquette">Valeur projetée médiane <button class="aide" type="button" data-aide="mediane">?</button></span>
+      <strong id="r-mediane"><span class="mini-spinner"></span></strong>
+      <span class="sous" id="r-mediane-sous">&nbsp;</span>
+    </div>
+    <div class="carte tuile">
+      <span class="etiquette">Total versé <button class="aide" type="button" data-aide="totalVerse">?</button></span>
+      <strong id="r-verse">—</strong>
+      <span class="sous" id="r-verse-sous">&nbsp;</span>
+    </div>
+    <div class="carte tuile">
+      <span class="etiquette">Gain estimé (médian) <button class="aide" type="button" data-aide="gain">?</button></span>
+      <strong id="r-gain">—</strong>
+      <span class="sous" id="r-gain-sous">&nbsp;</span>
+    </div>
+    <div class="carte tuile">
+      <span class="etiquette">Perte maximale historique <button class="aide" type="button" data-aide="drawdown">?</button></span>
+      <strong id="r-dd">—</strong>
+      <span class="sous" id="r-dd-sous">&nbsp;</span>
+    </div>
+  </section>
+
+  <!-- Onglets -->
+  <nav class="onglets" role="tablist" aria-label="Sections">
+    <button class="onglet" role="tab" data-onglet="portefeuille" aria-selected="true">Mon portefeuille</button>
+    <button class="onglet" role="tab" data-onglet="historique" aria-selected="false">Historique</button>
+    <button class="onglet" role="tab" data-onglet="projection" aria-selected="false">Projection</button>
+    <button class="onglet" role="tab" data-onglet="risques" aria-selected="false">Risques &amp; crises</button>
+    <button class="onglet" role="tab" data-onglet="fiscalite" aria-selected="false">Fiscalité</button>
+    <button class="onglet" role="tab" data-onglet="sources" aria-selected="false">Sources des données</button>
+  </nav>
+
+  <main>
+    <!-- ================= MON PORTEFEUILLE ================= -->
+    <section class="panneau pile" id="p-portefeuille" role="tabpanel">
+      <div class="grille grille-param">
+        <div class="carte">
+          <h2>Alimentation</h2>
+          <p class="sous-titre">Ce que vous placez au départ, puis chaque mois.</p>
+
+          <div class="champ">
+            <span>Saisie des lignes <button class="aide" type="button" data-aide="modeSaisie">?</button></span>
+            <div class="segment" role="radiogroup">
+              <label><input type="radio" name="modeSaisie" value="pourcentage" data-champ="modeSaisie"><span>En %</span></label>
+              <label><input type="radio" name="modeSaisie" value="montant" data-champ="modeSaisie"><span>En €</span></label>
+            </div>
+          </div>
+
+          <label class="champ">
+            <span>Capital de départ <button class="aide" type="button" data-aide="capital">?</button></span>
+            <div class="suffixe"><input type="number" min="0" step="500" data-champ="capital" inputmode="decimal"><em>€</em></div>
+          </label>
+
+          <label class="champ">
+            <span>Versement mensuel <button class="aide" type="button" data-aide="versement">?</button></span>
+            <div class="suffixe"><input type="number" min="0" step="10" data-champ="versementMensuel" inputmode="decimal"><em>€</em></div>
+          </label>
+
+          <label class="champ">
+            <span>Augmentation annuelle des versements <button class="aide" type="button" data-aide="hausse">?</button></span>
+            <div class="suffixe"><input type="number" min="0" max="20" step="0.5" data-champ="hausseVersement" inputmode="decimal"><em>%</em></div>
+          </label>
+
+          <label class="champ">
+            <span>Horizon de projection : <span class="valeur-curseur" data-affiche="horizon"></span> <button class="aide" type="button" data-aide="horizon">?</button></span>
+            <input type="range" min="1" max="40" step="1" data-champ="horizon">
+          </label>
+
+          <label class="interrupteur">
+            <input type="checkbox" data-champ="reequilibrage"> Rééquilibrage annuel <button class="aide" type="button" data-aide="reequilibrage">?</button>
+          </label>
+
+          <p class="note">Vos versements mensuels sont répartis selon les mêmes proportions que votre portefeuille.</p>
+        </div>
+
+        <div class="carte">
+          <h2>Mes lignes</h2>
+          <p class="sous-titre">Un actif, une part (ou un montant) et une enveloppe <button class="aide" type="button" data-aide="enveloppe">?</button> par ligne.</p>
+          <div id="lignes"></div>
+          <div class="pied-lignes">
+            <button class="bouton" type="button" id="ajouter-ligne">+ Ajouter une ligne</button>
+            <span class="total-lignes" id="total-lignes"></span>
+          </div>
+          <div id="alertes-lignes" style="margin-top:12px"></div>
+        </div>
+      </div>
+
+      <div class="grille">
+        <div class="carte"><h2>Par classe d'actifs</h2><p class="sous-titre">Actions, obligations, immobilier…</p><div class="graph petit"><canvas id="g-classes"></canvas></div></div>
+        <div class="carte"><h2>Par enveloppe</h2><p class="sous-titre">PEA, compte-titres, assurance-vie.</p><div class="graph petit"><canvas id="g-enveloppes"></canvas></div></div>
+        <div class="carte"><h2>Par zone géographique</h2><p class="sous-titre">Répartition approximative des indices.</p><div class="graph petit"><canvas id="g-zones"></canvas></div></div>
+      </div>
+    </section>
+
+    <!-- ================= HISTORIQUE ================= -->
+    <section class="panneau pile" id="p-historique" role="tabpanel" hidden>
+      <div class="carte">
+        <h2>Backtest historique <button class="aide" type="button" data-aide="backtest">?</button></h2>
+        <p class="sous-titre">Ce que votre portefeuille, avec votre capital et vos versements, aurait donné dans le passé.</p>
+        <div class="controles">
+          <label class="champ"><span>Début (1er janvier)</span><select data-champ="historique.debut" data-portee="historique" id="sel-debut"></select></label>
+          <label class="champ"><span>Fin (31 décembre)</span><select data-champ="historique.fin" data-portee="historique" id="sel-fin"></select></label>
+          <label class="champ" style="flex:2 1 220px"><span>Indice de référence <button class="aide" type="button" data-aide="reference">?</button></span><select data-champ="historique.reference" data-portee="historique" id="sel-reference"></select></label>
+          <label class="interrupteur"><input type="checkbox" data-champ="reequilibrage"> Rééquilibrage annuel</label>
+        </div>
+        <div class="graph haut"><canvas id="g-backtest"></canvas></div>
+      </div>
+      <div class="carte">
+        <h2>Résultat sur la période</h2>
+        <p class="sous-titre" id="bt-periode"></p>
+        <div class="kpis" id="bt-kpis"></div>
+      </div>
+      <div class="carte">
+        <h2>Effet du rééquilibrage annuel <button class="aide" type="button" data-aide="reequilibrage">?</button></h2>
+        <p class="sous-titre">Même portefeuille, mêmes versements, avec et sans rééquilibrage.</p>
+        <div class="kpis" id="bt-reeq"></div>
+        <p class="note" id="bt-reeq-phrase"></p>
+      </div>
+    </section>
+
+    <!-- ================= PROJECTION ================= -->
+    <section class="panneau pile" id="p-projection" role="tabpanel" hidden>
+      <div class="carte">
+        <h2>Projection Monte Carlo <button class="aide" type="button" data-aide="montecarlo">?</button></h2>
+        <p class="sous-titre">Des milliers d'avenirs possibles, construits à partir de vraies séquences de marché passées.</p>
+        <div class="controles">
+          <label class="champ" style="flex:2 1 220px"><span>Horizon : <span class="valeur-curseur" data-affiche="horizon"></span></span><input type="range" min="1" max="40" step="1" data-champ="horizon"></label>
+          <label class="champ"><span>Nombre de scénarios</span>
+            <select data-champ="projection.nSim"><option value="5000">5 000</option><option value="10000">10 000</option><option value="20000">20 000</option></select></label>
+          <label class="champ"><span>Blocs de <button class="aide" type="button" data-aide="bloc">?</button></span>
+            <select data-champ="projection.bloc"><option value="1">1 an</option><option value="3">3 ans</option><option value="5">5 ans</option><option value="8">8 ans</option></select></label>
+        </div>
+        <div class="graph haut">
+          <div class="chargement" id="mc-chargement"><div><div class="spinner"></div>Calcul des scénarios…</div></div>
+          <canvas id="g-eventail"></canvas>
+        </div>
+        <p class="note">Graphique en éventail <button class="aide" type="button" data-aide="eventail">?</button> : la zone foncée contient la moitié des scénarios, la zone claire 8 scénarios sur 10.</p>
+        <div id="mc-alertes" style="margin-top:10px"></div>
+      </div>
+
+      <div class="grille" id="mc-scenarios"></div>
+
+      <div class="carte">
+        <h2>En clair</h2>
+        <p class="sous-titre" id="mc-sous-titre"></p>
+        <ul class="phrases" id="mc-phrases"></ul>
+      </div>
+
+      <div class="carte">
+        <h2>Comment sont construits ces scénarios ?</h2>
+        <div class="regimes" style="margin-top:12px">
+          <div class="regime"><h3>1. On tire des blocs d'années réelles <button class="aide" type="button" data-aide="bootstrap">?</button></h3>
+            <p>Chaque scénario enchaîne des blocs de plusieurs années consécutives tirées au hasard dans l'historique 1990-2025 (par exemple 2007-2011, puis 2016-2020…). Tous les actifs de l'année tirée bougent ensemble : on conserve leurs liens (corrélations) et les enchaînements de marché (krach puis rebond).</p></div>
+          <div class="regime"><h3>2. On applique vos versements</h3>
+            <p>Chaque mois, votre versement est investi selon vos proportions (avec rééquilibrage : d'abord vers les lignes en retard), en tenant compte des frais annuels des fonds et de l'assurance-vie. Le plafond du PEA est respecté : au-delà, les versements prévus sur le PEA vont sur un compte-titres.</p></div>
+          <div class="regime"><h3>3. On classe les résultats <button class="aide" type="button" data-aide="percentile">?</button></h3>
+            <p>On range les scénarios du pire au meilleur. Le scénario « pessimiste » est celui qui fait mieux que 10 % des cas seulement, le « médian » est au milieu, l'« optimiste » n'est battu que par 10 % des cas.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= RISQUES & CRISES ================= -->
+    <section class="panneau pile" id="p-risques" role="tabpanel" hidden>
+      <div class="carte">
+        <h2>Indicateurs de risque</h2>
+        <p class="sous-titre" id="rq-sous-titre"></p>
+        <div class="grille" id="rq-indicateurs"></div>
+      </div>
+      <div class="grille">
+        <div class="carte"><h2>Performance année par année</h2><p class="sous-titre">Rendement de votre portefeuille chaque année civile.</p><div class="graph"><canvas id="g-annees"></canvas></div></div>
+        <div class="carte"><h2>Baisses depuis le dernier sommet <button class="aide" type="button" data-aide="drawdown">?</button></h2><p class="sous-titre">À 0 %, le portefeuille est à son plus haut.</p><div class="graph"><canvas id="g-drawdown"></canvas></div></div>
+      </div>
+      <div class="carte">
+        <h2>Test de crise <button class="aide" type="button" data-aide="crise">?</button></h2>
+        <p class="sous-titre" id="cr-sous-titre"></p>
+        <div class="graph petit" style="margin-bottom:20px"><canvas id="g-crises"></canvas></div>
+        <div class="grille" id="cr-cartes"></div>
+      </div>
+    </section>
+
+    <!-- ================= FISCALITÉ ================= -->
+    <section class="panneau pile" id="p-fiscalite" role="tabpanel" hidden>
+      <div class="carte">
+        <h2>Retrait total à l'horizon</h2>
+        <p class="sous-titre">Ce qu'il vous resterait après impôts si vous retiriez tout dans <span data-affiche="horizon"></span>.</p>
+        <div class="controles">
+          <div class="champ" style="flex:0 1 auto"><span>Situation <button class="aide" type="button" data-aide="abattement">?</button></span>
+            <div class="segment" role="radiogroup">
+              <label><input type="radio" name="situation" value="celibataire" data-champ="fiscalite.situation" data-portee="fiscal"><span>Célibataire</span></label>
+              <label><input type="radio" name="situation" value="couple" data-champ="fiscalite.situation" data-portee="fiscal"><span>Couple</span></label>
+            </div></div>
+          <label class="champ"><span>Âge actuel de votre PEA <button class="aide" type="button" data-aide="anciennete">?</button></span><div class="suffixe"><input type="number" min="0" max="60" step="1" data-champ="fiscalite.anciennetePEA" data-portee="fiscal"><em>ans</em></div></label>
+          <label class="champ"><span>Âge actuel de votre assurance-vie</span><div class="suffixe"><input type="number" min="0" max="60" step="1" data-champ="fiscalite.ancienneteAV" data-portee="fiscal"><em>ans</em></div></label>
+        </div>
+        <div id="fi-alertes"></div>
+      </div>
+      <div class="grille" id="fi-scenarios"></div>
+      <div class="carte">
+        <h2>Brut, impôts et net par scénario</h2>
+        <p class="sous-titre">Ce que vous avez versé, ce que vous gardez, ce que vous payez.</p>
+        <div class="graph petit"><canvas id="g-fiscalite"></canvas></div>
+      </div>
+      <div class="carte">
+        <h2>Les règles appliquées</h2>
+        <p class="sous-titre">Paramètres modifiables dans l'objet <code>PARAMETRES_FISCAUX</code> en haut du fichier. Taux à vérifier : ils changent avec les lois de finances.</p>
+        <div class="regimes" id="fi-regles"></div>
+        <p class="note">Simplifications : option pour le barème progressif non simulée ; sur le compte-titres, les dividendes sont en réalité taxés chaque année (ici, tout est taxé à la sortie) ; les impôts dus sur les ventes de rééquilibrage à l’intérieur du compte-titres ne sont pas simulés (dans le PEA et l’assurance-vie, ces arbitrages sont sans impôt) ; pas de droits de succession ni de rente.</p>
+      </div>
+    </section>
+
+    <!-- ================= SOURCES ================= -->
+    <section class="panneau pile" id="p-sources" role="tabpanel" hidden>
+      <div class="carte">
+        <h2>D'où viennent les chiffres ?</h2>
+        <p class="sous-titre">Transparence sur les données intégrées dans ce fichier.</p>
+        <div class="msg attention" style="margin-bottom:10px"><strong>Important :</strong> aucune donnée n'a été téléchargée. Les séries ont été saisies à partir des valeurs historiques publiées par les fournisseurs d'indices, connues de mémoire : elles sont <strong>annuelles</strong>, arrondies, et peuvent différer de quelques dixièmes de point des chiffres officiels. Les cases <span style="background:var(--alerte-doux);color:var(--alerte);padding:0 4px;border-radius:4px">≈ surlignées</span> sont des estimations ou des reconstitutions, moins fiables.</div>
+        <div class="msg info">Tous les rendements sont exprimés <strong>en euros</strong>, dividendes ou coupons réinvestis. Les séries en dollars sont converties avec le taux EUR/USD de fin d'année (avant 1999 : « euro synthétique » reconstitué à partir du mark allemand, 1 € = 1,95583 DEM). Avec des données annuelles, les chutes brutales à l'intérieur d'une année (mars 2020 par exemple) n'apparaissent pas.</div>
+      </div>
+      <div class="carte">
+        <h2>Séries utilisées</h2>
+        <div class="table-defil" style="margin-top:12px"><table id="table-sources"></table></div>
+      </div>
+      <div class="carte">
+        <h2>Rendements annuels en euros (%)</h2>
+        <p class="sous-titre">Après conversion en euros, avant frais. ≈ = valeur approximative.</p>
+        <div class="table-defil" style="max-height:520px"><table class="table-donnees" id="table-donnees"></table></div>
+      </div>
+      <div class="carte">
+        <h2>Contrôles de calcul</h2>
+        <p class="sous-titre">Le moteur est vérifié au chargement sur des cas simples calculables à la main.</p>
+        <div class="table-defil"><table id="table-controles"></table></div>
+      </div>
+      <div class="carte">
+        <h2>Ajouter un actif</h2>
+        <p class="sous-titre">Ouvrez ce fichier dans un éditeur de texte, cherchez <code>DONNEES_MARCHE</code> et ajoutez une entrée sur ce modèle :</p>
+<pre>MON_ACTIF: {
+  nom: 'Nom complet', nomCourt: 'Nom court',
+  classe: 'Actions',          // Actions | Obligations | Fonds euros | Immobilier | Or &amp; matières premières
+  zones: { 'Europe (hors France)': 100 },
+  devise: 'EUR',              // 'EUR' ou 'USD' (converti automatiquement)
+  rendements: { 1990: 5.2, 1991: -3.1, /* … */ 2025: 7.0 },   // % par an, dividendes inclus
+  // ou bien : niveaux: { 1989: 1000, 1990: 1052, … } (+ dividendes: { 1990: 3.0, … })
+  approx: [2025],             // années approximatives (ou 'toutes')
+  enveloppes: { PEA: 'non', CTO: 'oui', AV: 'oui' },          // 'oui' | 'etf' | 'attention' | 'non'
+  fraisAnnuels: 0.2,          // % par an (frais de l'ETF)
+  description: 'Une phrase simple.',
+  source: 'Fournisseur, nom exact de l’indice', periode: '1990-2025',
+},</pre>
+        <p class="note">Si un actif n'a pas d'historique complet, les calculs utilisent automatiquement les seules années communes à tous les actifs du portefeuille.</p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="avertissement-bas" role="note">Simulation à but éducatif, les performances passées ne préjugent pas des performances futures.</div>
+<div id="bulle" role="tooltip"></div>
+
+
+<!-- ===========================================================================
+     4. DONNÉES DE MARCHÉ
+     Séries ANNUELLES 1990-2025, saisies à partir des valeurs publiées par les
+     fournisseurs d'indices (sans téléchargement). Chaque actif documente sa
+     source, sa période et ses années approximatives (« approx »).
+
+     Format d'un actif :
+       rendements : { année: % de rendement total sur l'année }   OU
+       niveaux    : { année: niveau de fin d'année } (+ dividendes : { année: % })
+       devise     : 'EUR' ou 'USD' (conversion automatique via eurusd)
+     =========================================================================== -->
+<script id="donnees-marche">
+const DONNEES_MARCHE = {
+
+  /* Taux de change de fin d'année : nombre de dollars pour 1 euro.
+     Source : BCE (taux de référence) depuis 1999. 1989-1998 : « euro
+     synthétique » reconstitué via le cours USD/DEM de fin d'année
+     (Bundesbank) et la parité fixe 1 € = 1,95583 DEM. 2025 : approximatif. */
+  eurusd: {
+    source: 'BCE (1999-2025) ; avant 1999 : euro synthétique via USD/DEM (Deutsche Bundesbank)',
+    approx: [2025],
+    niveaux: {
+      1989: 1.156, 1990: 1.309, 1991: 1.290, 1992: 1.212, 1993: 1.133, 1994: 1.263,
+      1995: 1.364, 1996: 1.258, 1997: 1.088, 1998: 1.169, 1999: 1.0070, 2000: 0.9305,
+      2001: 0.8813, 2002: 1.0487, 2003: 1.2630, 2004: 1.3621, 2005: 1.1797, 2006: 1.3170,
+      2007: 1.4721, 2008: 1.3917, 2009: 1.4406, 2010: 1.3362, 2011: 1.2939, 2012: 1.3194,
+      2013: 1.3791, 2014: 1.2141, 2015: 1.0887, 2016: 1.0541, 2017: 1.1993, 2018: 1.1450,
+      2019: 1.1234, 2020: 1.2271, 2021: 1.1326, 2022: 1.0666, 2023: 1.1050, 2024: 1.0389,
+      2025: 1.175,
+    },
+  },
+
+  /* Taux « sans risque » (moyenne annuelle d'un placement monétaire en euros),
+     utilisé pour le ratio de Sharpe. 1990-1998 : taux interbancaire allemand à
+     3 mois (FIBOR), approximatif ; 1999-2021 : EONIA ; 2022-2025 : €STR. */
+  tauxSansRisque: {
+    source: 'FIBOR 3 mois (1990-1998, approx.), EONIA (1999-2021), €STR (2022-2025) — moyennes annuelles',
+    approx: [1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 2025],
+    valeurs: {
+      1990: 8.4, 1991: 9.2, 1992: 9.5, 1993: 7.3, 1994: 5.4, 1995: 4.5, 1996: 3.3, 1997: 3.3,
+      1998: 3.5, 1999: 2.7, 2000: 4.1, 2001: 4.4, 2002: 3.3, 2003: 2.3, 2004: 2.1, 2005: 2.1,
+      2006: 2.8, 2007: 3.9, 2008: 3.9, 2009: 0.7, 2010: 0.4, 2011: 0.9, 2012: 0.2, 2013: 0.1,
+      2014: 0.1, 2015: -0.1, 2016: -0.3, 2017: -0.4, 2018: -0.4, 2019: -0.4, 2020: -0.5,
+      2021: -0.6, 2022: 0.0, 2023: 3.2, 2024: 3.6, 2025: 2.2,
+    },
+  },
+
+  actifs: {
+
+    /* ---------------------------------------------------------------- ACTIONS */
+
+    /* MSCI World Net Total Return (USD), dividendes nets réinvestis.
+       Source : MSCI Inc. Période : 1990-2025. 2025 : estimation. */
+    MSCI_WORLD: {
+      nom: 'MSCI World — actions des pays développés', nomCourt: 'MSCI World',
+      classe: 'Actions',
+      zones: { 'Amérique du Nord': 75, 'Europe (hors France)': 12.5, 'France': 2.5, 'Asie-Pacifique développée': 10 },
+      devise: 'USD',
+      rendements: {
+        1990: -17.0, 1991: 18.3, 1992: -5.2, 1993: 22.5, 1994: 5.1, 1995: 20.7, 1996: 13.5,
+        1997: 15.8, 1998: 24.3, 1999: 24.9, 2000: -13.2, 2001: -16.8, 2002: -19.9, 2003: 33.1,
+        2004: 14.7, 2005: 9.5, 2006: 20.1, 2007: 9.0, 2008: -40.7, 2009: 30.0, 2010: 11.8,
+        2011: -5.5, 2012: 15.8, 2013: 26.7, 2014: 4.9, 2015: -0.9, 2016: 7.5, 2017: 22.4,
+        2018: -8.7, 2019: 27.7, 2020: 15.9, 2021: 21.8, 2022: -18.1, 2023: 23.8, 2024: 18.7,
+        2025: 21.1,
+      },
+      approx: [2025],
+      enveloppes: { PEA: 'etf', CTO: 'oui', AV: 'oui' },
+      fraisAnnuels: 0.2,
+      description: "Environ 1 300 grandes entreprises de 23 pays développés (dont ~70 % américaines).",
+      source: 'MSCI Inc. — MSCI World Net Total Return, en USD, converti en euros',
+      periode: '1990-2025',
+    },
+
+    /* S&P 500 Total Return (USD), dividendes réinvestis.
+       Source : S&P Dow Jones Indices. Période : 1990-2025. 2025 : estimation. */
+    SP500: {
+      nom: 'S&P 500 — 500 grandes entreprises américaines', nomCourt: 'S&P 500',
+      classe: 'Actions',
+      zones: { 'Amérique du Nord': 100 },
+      devise: 'USD',
+      rendements: {
+        1990: -3.1, 1991: 30.5, 1992: 7.6, 1993: 10.1, 1994: 1.3, 1995: 37.6, 1996: 23.0,
+        1997: 33.4, 1998: 28.6, 1999: 21.0, 2000: -9.1, 2001: -11.9, 2002: -22.1, 2003: 28.7,
+        2004: 10.9, 2005: 4.9, 2006: 15.8, 2007: 5.5, 2008: -37.0, 2009: 26.5, 2010: 15.1,
+        2011: 2.1, 2012: 16.0, 2013: 32.4, 2014: 13.7, 2015: 1.4, 2016: 12.0, 2017: 21.8,
+        2018: -4.4, 2019: 31.5, 2020: 18.4, 2021: 28.7, 2022: -18.1, 2023: 26.3, 2024: 25.0,
+        2025: 17.9,
+      },
+      approx: [2025],
+      enveloppes: { PEA: 'etf', CTO: 'oui', AV: 'oui' },
+      fraisAnnuels: 0.15,
+      description: "Les 500 plus grandes entreprises cotées aux États-Unis (Apple, Microsoft, Nvidia…).",
+      source: 'S&P Dow Jones Indices — S&P 500 Total Return, en USD, converti en euros',
+      periode: '1990-2025',
+    },
+
+    /* CAC 40 : niveaux de clôture de fin d'année (Euronext), + rendement du
+       dividende ESTIMÉ pour approcher le CAC 40 « dividendes réinvestis »
+       (CAC 40 GR). Dividendes : approximatifs. Niveau 2025 : estimation. */
+    CAC40: {
+      nom: 'CAC 40 — 40 grandes entreprises françaises', nomCourt: 'CAC 40',
+      classe: 'Actions',
+      zones: { 'France': 100 },
+      devise: 'EUR',
+      niveaux: {
+        1989: 2001.08, 1990: 1517.93, 1991: 1765.66, 1992: 1857.78, 1993: 2268.22, 1994: 1881.15,
+        1995: 1871.97, 1996: 2315.73, 1997: 2998.91, 1998: 3942.66, 1999: 5958.32, 2000: 5926.42,
+        2001: 4624.58, 2002: 3063.91, 2003: 3557.90, 2004: 3821.16, 2005: 4715.23, 2006: 5541.76,
+        2007: 5614.08, 2008: 3217.97, 2009: 3936.33, 2010: 3804.78, 2011: 3159.81, 2012: 3641.07,
+        2013: 4295.95, 2014: 4272.75, 2015: 4637.06, 2016: 4862.31, 2017: 5312.56, 2018: 4730.69,
+        2019: 5978.06, 2020: 5551.41, 2021: 7153.03, 2022: 6473.76, 2023: 7543.18, 2024: 7380.74,
+        2025: 8150,
+      },
+      // Rendement du dividende estimé (% par an), ajouté à la variation de l'indice
+      dividendes: {
+        1990: 3.5, 1991: 3.5, 1992: 3.5, 1993: 3.2, 1994: 3.2, 1995: 3.0, 1996: 2.8, 1997: 2.5,
+        1998: 2.2, 1999: 2.0, 2000: 2.0, 2001: 2.5, 2002: 3.0, 2003: 3.5, 2004: 3.3, 2005: 3.3,
+        2006: 3.3, 2007: 3.5, 2008: 4.5, 2009: 3.5, 2010: 3.6, 2011: 4.0, 2012: 3.6, 2013: 3.3,
+        2014: 3.2, 2015: 3.1, 2016: 3.3, 2017: 3.1, 2018: 3.4, 2019: 3.2, 2020: 2.0, 2021: 2.6,
+        2022: 3.2, 2023: 3.3, 2024: 3.2, 2025: 3.0,
+      },
+      approx: [2025],
+      approxNote: 'Dividendes estimés chaque année (≈ ±0,5 pt).',
+      enveloppes: { PEA: 'oui', CTO: 'oui', AV: 'oui' },
+      fraisAnnuels: 0.25,
+      description: "Les 40 plus grandes capitalisations de la Bourse de Paris (LVMH, TotalEnergies…).",
+      source: 'Euronext — niveaux de clôture annuels du CAC 40 + dividendes estimés (≈ CAC 40 GR)',
+      periode: '1990-2025',
+    },
+
+    /* Euro Stoxx 50 : niveaux de fin d'année (STOXX Ltd., base 1000 au
+       31/12/1991) + dividendes ESTIMÉS. 1990-1991 : reconstitution
+       approximative à partir des grands indices européens. 2025 : estimation. */
+    EUROSTOXX50: {
+      nom: 'Euro Stoxx 50 — 50 leaders de la zone euro', nomCourt: 'Euro Stoxx 50',
+      classe: 'Actions',
+      zones: { 'France': 35, 'Europe (hors France)': 65 },
+      devise: 'EUR',
+      niveaux: {
+        1989: 1130.2, 1990: 892.9, 1991: 1000.00, 1992: 1033.51, 1993: 1433.34, 1994: 1320.59,
+        1995: 1506.82, 1996: 1850.32, 1997: 2531.99, 1998: 3342.32, 1999: 4904.46, 2000: 4772.39,
+        2001: 3806.13, 2002: 2386.41, 2003: 2760.66, 2004: 2951.24, 2005: 3578.93, 2006: 4119.94,
+        2007: 4399.72, 2008: 2451.48, 2009: 2964.96, 2010: 2792.82, 2011: 2316.55, 2012: 2635.93,
+        2013: 3109.00, 2014: 3146.43, 2015: 3267.52, 2016: 3290.52, 2017: 3503.96, 2018: 3001.42,
+        2019: 3745.15, 2020: 3552.64, 2021: 4298.41, 2022: 3793.62, 2023: 4521.44, 2024: 4895.98,
+        2025: 5790,
+      },
+      dividendes: {
+        1990: 3.0, 1991: 3.0, 1992: 3.0, 1993: 2.8, 1994: 2.8, 1995: 2.8, 1996: 2.6, 1997: 2.3,
+        1998: 2.0, 1999: 1.8, 2000: 2.0, 2001: 2.5, 2002: 3.3, 2003: 3.5, 2004: 3.3, 2005: 3.3,
+        2006: 3.3, 2007: 3.5, 2008: 4.8, 2009: 4.0, 2010: 4.0, 2011: 4.5, 2012: 4.0, 2013: 3.7,
+        2014: 3.5, 2015: 3.3, 2016: 3.5, 2017: 3.2, 2018: 3.5, 2019: 3.3, 2020: 2.2, 2021: 2.8,
+        2022: 3.3, 2023: 3.3, 2024: 3.2, 2025: 3.0,
+      },
+      approx: [1990, 1991, 2025],
+      approxNote: 'Dividendes estimés chaque année (≈ ±0,5 pt).',
+      enveloppes: { PEA: 'oui', CTO: 'oui', AV: 'oui' },
+      fraisAnnuels: 0.15,
+      description: "Les 50 plus grandes entreprises de la zone euro (ASML, SAP, LVMH, Siemens…).",
+      source: 'STOXX Ltd. — niveaux annuels de l’Euro Stoxx 50 + dividendes estimés',
+      periode: '1990-2025 (1990-1991 reconstitués)',
+    },
+
+    /* MSCI Emerging Markets (USD). Net Total Return depuis 1999, Gross (dividendes
+       bruts) avant : légère surestimation (≈ 0,3 pt/an). Source : MSCI Inc. */
+    MSCI_EM: {
+      nom: 'MSCI Emerging Markets — actions des pays émergents', nomCourt: 'MSCI Émergents',
+      classe: 'Actions',
+      zones: { 'Pays émergents': 100 },
+      devise: 'USD',
+      rendements: {
+        1990: -10.6, 1991: 59.9, 1992: 11.4, 1993: 74.8, 1994: -7.3, 1995: -5.2, 1996: 6.0,
+        1997: -11.6, 1998: -25.3, 1999: 66.4, 2000: -30.6, 2001: -2.6, 2002: -6.2, 2003: 55.8,
+        2004: 25.6, 2005: 34.0, 2006: 32.2, 2007: 39.4, 2008: -53.3, 2009: 78.5, 2010: 18.9,
+        2011: -18.4, 2012: 18.2, 2013: -2.6, 2014: -2.2, 2015: -14.9, 2016: 11.2, 2017: 37.3,
+        2018: -14.6, 2019: 18.4, 2020: 18.3, 2021: -2.5, 2022: -20.1, 2023: 9.8, 2024: 7.5,
+        2025: 33.6,
+      },
+      approx: [1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 2025],
+      approxNote: '1990-1998 : dividendes bruts (Gross).',
+      enveloppes: { PEA: 'etf', CTO: 'oui', AV: 'oui' },
+      fraisAnnuels: 0.3,
+      description: "Environ 1 200 entreprises de 24 pays émergents (Chine, Inde, Taïwan, Brésil…).",
+      source: 'MSCI Inc. — MSCI Emerging Markets (Net depuis 1999, Gross avant), en USD, converti en euros',
+      periode: '1990-2025',
+    },
+
+    /* ------------------------------------------------------------ OBLIGATIONS */
+
+    /* Obligations d'État de la zone euro, toutes maturités (type Bloomberg Euro
+       Aggregate Treasury / ICE BofA Euro Government). 1990-1998 : reconstitution
+       approximative (emprunts d'État allemands et français). 2025 : estimation. */
+    OBLIG_ETAT_EUR: {
+      nom: "Obligations d'État de la zone euro", nomCourt: 'Obligations État €',
+      classe: 'Obligations',
+      zones: { 'France': 25, 'Europe (hors France)': 75 },
+      devise: 'EUR',
+      rendements: {
+        1990: 3.0, 1991: 13.0, 1992: 11.0, 1993: 17.0, 1994: -4.0, 1995: 18.0, 1996: 12.0,
+        1997: 8.5, 1998: 11.0, 1999: -2.8, 2000: 7.3, 2001: 5.8, 2002: 9.1, 2003: 4.0,
+        2004: 7.6, 2005: 5.4, 2006: -0.3, 2007: 1.8, 2008: 9.2, 2009: 4.4, 2010: 1.1,
+        2011: 3.4, 2012: 11.0, 2013: 2.2, 2014: 13.1, 2015: 1.6, 2016: 3.2, 2017: 0.2,
+        2018: 1.0, 2019: 6.8, 2020: 5.0, 2021: -3.4, 2022: -18.5, 2023: 7.1, 2024: 1.8,
+        2025: 0.6,
+      },
+      approx: [1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 2025],
+      enveloppes: { PEA: 'non', CTO: 'oui', AV: 'oui' },
+      fraisAnnuels: 0.15,
+      description: "Prêts consentis aux États de la zone euro (France, Allemagne, Italie…), remboursés avec intérêts.",
+      source: 'Bloomberg Euro Aggregate Treasury / ICE BofA Euro Government (1999-2025) ; reconstitution avant 1999',
+      periode: '1990-2025 (1990-1998 reconstitués)',
+    },
+
+    /* Obligations d'entreprises en euros, qualité « investissement » (type iBoxx €
+       Corporates / Bloomberg Euro Aggregate Corporate), disponibles depuis 1999.
+       1990-1998 : approximation = obligations d'État + petite prime. */
+    OBLIG_ENTREPRISE_EUR: {
+      nom: "Obligations d'entreprises en euros (catégorie investissement)", nomCourt: 'Obligations entreprises €',
+      classe: 'Obligations',
+      zones: { 'France': 25, 'Europe (hors France)': 55, 'Amérique du Nord': 20 },
+      devise: 'EUR',
+      rendements: {
+        1990: 3.3, 1991: 13.3, 1992: 11.3, 1993: 17.3, 1994: -3.7, 1995: 18.3, 1996: 12.3,
+        1997: 8.8, 1998: 10.0, 1999: -1.6, 2000: 5.1, 2001: 6.6, 2002: 8.8, 2003: 6.5,
+        2004: 7.5, 2005: 4.1, 2006: 0.6, 2007: 0.0, 2008: -3.3, 2009: 15.0, 2010: 4.8,
+        2011: 1.8, 2012: 13.0, 2013: 2.4, 2014: 8.4, 2015: -0.6, 2016: 4.7, 2017: 2.4,
+        2018: -1.3, 2019: 6.2, 2020: 2.8, 2021: -1.0, 2022: -13.6, 2023: 8.2, 2024: 4.7,
+        2025: 3.0,
+      },
+      approx: [1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 2025],
+      approxNote: '1990-1998 : obligations d’État + prime estimée (l’indice n’existait pas).',
+      enveloppes: { PEA: 'non', CTO: 'oui', AV: 'oui' },
+      fraisAnnuels: 0.15,
+      description: "Prêts à de grandes entreprises solides (TotalEnergies, Siemens…), un peu mieux rémunérés que les États.",
+      source: 'iBoxx € Corporates / Bloomberg Euro Aggregate Corporate (1999-2025) ; approximation avant',
+      periode: '1990-2025 (1990-1998 approximés)',
+    },
+
+    /* Fonds euros d'assurance-vie : taux moyen servi par le marché, net de frais
+       de gestion, avant prélèvements sociaux. Source : FFA / France Assureurs et
+       ACPR. 1990-1994 et 2025 : approximatifs. */
+    FONDS_EUROS: {
+      nom: "Fonds euros d'assurance-vie (taux moyen du marché)", nomCourt: 'Fonds euros',
+      classe: 'Fonds euros',
+      zones: { 'France': 60, 'Europe (hors France)': 40 },
+      devise: 'EUR',
+      rendements: {
+        1990: 9.0, 1991: 9.0, 1992: 8.6, 1993: 8.0, 1994: 7.3, 1995: 7.5, 1996: 6.9, 1997: 6.1,
+        1998: 5.7, 1999: 5.3, 2000: 5.3, 2001: 5.3, 2002: 4.8, 2003: 4.5, 2004: 4.4, 2005: 4.2,
+        2006: 4.1, 2007: 4.1, 2008: 4.0, 2009: 3.6, 2010: 3.4, 2011: 3.0, 2012: 2.9, 2013: 2.8,
+        2014: 2.5, 2015: 2.3, 2016: 1.9, 2017: 1.8, 2018: 1.8, 2019: 1.4, 2020: 1.3, 2021: 1.3,
+        2022: 1.9, 2023: 2.6, 2024: 2.6, 2025: 2.6,
+      },
+      approx: [1990, 1991, 1992, 1993, 1994, 2025],
+      enveloppes: { PEA: 'non', CTO: 'non', AV: 'oui' },
+      notesEnveloppes: {
+        PEA: "Le fonds euros n'existe qu'en assurance-vie.",
+        CTO: "Le fonds euros n'existe qu'en assurance-vie.",
+      },
+      fraisAnnuels: 0,          // taux déjà net des frais de gestion du contrat
+      description: "Le support « sans risque » de l'assurance-vie : le capital est garanti par l'assureur, les intérêts acquis chaque année.",
+      source: 'France Assureurs (ex-FFA) / ACPR — taux moyen servi, net de frais de gestion',
+      periode: '1990-2025',
+    },
+
+    /* ------------------------------------------------------------- IMMOBILIER */
+
+    /* SCPI : rentabilité globale moyenne = taux de distribution + variation du
+       prix moyen des parts. Sources : ASPIM / IEIF. Série ENTIÈREMENT
+       APPROXIMATIVE (reconstituée à partir des taux de distribution publiés et de
+       l'évolution moyenne des prix de parts). Frais d'entrée ≈ 8 % non inclus
+       dans les rendements : ils sont appliqués sur chaque versement. */
+    SCPI: {
+      nom: 'SCPI — immobilier non coté (moyenne du marché)', nomCourt: 'SCPI',
+      classe: 'Immobilier',
+      zones: { 'France': 75, 'Europe (hors France)': 25 },
+      devise: 'EUR',
+      rendements: {
+        1990: 9.0, 1991: 4.0, 1992: -1.0, 1993: -3.0, 1994: -2.0, 1995: 0.0, 1996: 1.0,
+        1997: 2.5, 1998: 5.0, 1999: 6.0, 2000: 7.5, 2001: 7.7, 2002: 7.8, 2003: 8.0,
+        2004: 9.0, 2005: 10.5, 2006: 11.0, 2007: 10.0, 2008: 3.5, 2009: 2.5, 2010: 5.5,
+        2011: 7.5, 2012: 6.0, 2013: 4.8, 2014: 5.4, 2015: 5.2, 2016: 4.7, 2017: 4.8,
+        2018: 4.9, 2019: 5.0, 2020: 4.2, 2021: 5.5, 2022: 5.0, 2023: 3.5, 2024: -1.5,
+        2025: 3.0,
+      },
+      approx: 'toutes',
+      approxNote: 'Série reconstituée : distribution + variation estimée du prix des parts.',
+      enveloppes: { PEA: 'non', CTO: 'attention', AV: 'oui' },
+      notesEnveloppes: {
+        CTO: "Les SCPI ne se logent pas dans un compte-titres : on les achète en direct (fiscalité des revenus fonciers, souvent plus lourde) ou via une assurance-vie. La simulation applique ici la fiscalité du CTO par simplification.",
+      },
+      fraisAnnuels: 0,
+      fraisEntree: 8,           // % prélevés sur chaque versement
+      description: "Parts de sociétés qui possèdent des bureaux, commerces, entrepôts… et reversent les loyers. Peu liquides, frais d'entrée élevés (~8 %).",
+      source: 'ASPIM / IEIF — taux de distribution et variation du prix moyen des parts (reconstitution)',
+      periode: '1990-2025',
+    },
+
+    /* Foncières cotées mondiales : FTSE EPRA Nareit Developed Total Return (USD).
+       Source : FTSE Russell / EPRA. 1990-2002 : reconstitution approximative ;
+       2024-2025 : approximatifs. */
+    REIT_MONDE: {
+      nom: 'Foncières cotées mondiales (REIT, FTSE EPRA Nareit Developed)', nomCourt: 'REIT monde',
+      classe: 'Immobilier',
+      zones: { 'Amérique du Nord': 65, 'Asie-Pacifique développée': 20, 'Europe (hors France)': 13, 'France': 2 },
+      devise: 'USD',
+      rendements: {
+        1990: -24.0, 1991: 12.0, 1992: -12.0, 1993: 34.0, 1994: -2.0, 1995: 11.0, 1996: 25.0,
+        1997: -1.0, 1998: -8.0, 1999: 4.0, 2000: 8.0, 2001: -1.0, 2002: 3.0, 2003: 40.7,
+        2004: 37.9, 2005: 15.3, 2006: 42.4, 2007: -7.0, 2008: -47.7, 2009: 38.3, 2010: 20.4,
+        2011: -5.8, 2012: 28.7, 2013: 4.4, 2014: 15.9, 2015: 0.1, 2016: 5.0, 2017: 11.4,
+        2018: -4.7, 2019: 23.1, 2020: -8.2, 2021: 27.2, 2022: -24.4, 2023: 10.9, 2024: 1.8,
+        2025: 8.5,
+      },
+      approx: [1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2024, 2025],
+      enveloppes: { PEA: 'non', CTO: 'oui', AV: 'oui' },
+      notesEnveloppes: { PEA: "Un indice immobilier mondial n'est pas éligible au PEA (seules certaines foncières européennes le sont, en direct)." },
+      fraisAnnuels: 0.25,
+      description: "Sociétés cotées en Bourse qui possèdent et louent de l'immobilier (bureaux, logements, entrepôts) dans les pays développés.",
+      source: 'FTSE Russell / EPRA — FTSE EPRA Nareit Developed Total Return, en USD, converti en euros',
+      periode: '1990-2025 (1990-2002 reconstitués)',
+    },
+
+    /* ------------------------------------------- OR ET MATIÈRES PREMIÈRES */
+
+    /* Or : cours de fin d'année en dollars l'once (LBMA Gold Price PM),
+       converti en euros. Niveau 2025 : estimation. */
+    OR: {
+      nom: 'Or (en euros)', nomCourt: 'Or',
+      classe: 'Or & matières premières',
+      zones: { 'Mondial (sans zone)': 100 },
+      devise: 'USD',
+      niveaux: {
+        1989: 401.0, 1990: 386.2, 1991: 353.2, 1992: 333.0, 1993: 391.8, 1994: 383.3, 1995: 387.0,
+        1996: 369.3, 1997: 290.2, 1998: 287.8, 1999: 290.3, 2000: 272.7, 2001: 276.5, 2002: 342.8,
+        2003: 417.3, 2004: 438.0, 2005: 513.0, 2006: 632.0, 2007: 833.8, 2008: 869.8, 2009: 1087.5,
+        2010: 1405.5, 2011: 1531.0, 2012: 1657.5, 2013: 1204.5, 2014: 1206.0, 2015: 1060.0,
+        2016: 1145.9, 2017: 1291.0, 2018: 1279.0, 2019: 1514.8, 2020: 1887.6, 2021: 1805.9,
+        2022: 1813.8, 2023: 2062.4, 2024: 2610.0, 2025: 4340,
+      },
+      approx: [2025],
+      enveloppes: { PEA: 'non', CTO: 'oui', AV: 'attention' },
+      notesEnveloppes: { AV: "Peu de contrats d'assurance-vie proposent de l'or : vérifiez que le vôtre le permet." },
+      fraisAnnuels: 0.15,
+      description: "Métal précieux considéré comme une valeur refuge ; ne verse ni intérêt ni dividende.",
+      source: 'LBMA Gold Price (PM), cours de fin d’année en USD, converti en euros',
+      periode: '1990-2025',
+    },
+
+    /* Matières premières larges : Bloomberg Commodity Index Total Return (USD),
+       ex-Dow Jones-UBS / DJ-AIG. Source : Bloomberg. 1990-1993 et 2025 :
+       approximatifs. */
+    MATIERES_PREMIERES: {
+      nom: 'Matières premières (Bloomberg Commodity Index)', nomCourt: 'Matières premières',
+      classe: 'Or & matières premières',
+      zones: { 'Mondial (sans zone)': 100 },
+      devise: 'USD',
+      rendements: {
+        1990: 4.0, 1991: -6.1, 1992: 4.4, 1993: -0.1, 1994: 16.2, 1995: 15.1, 1996: 23.2,
+        1997: -3.4, 1998: -27.0, 1999: 24.4, 2000: 31.8, 2001: -19.5, 2002: 25.9, 2003: 23.9,
+        2004: 9.1, 2005: 21.4, 2006: 2.1, 2007: 16.2, 2008: -35.7, 2009: 18.9, 2010: 16.8,
+        2011: -13.3, 2012: -1.1, 2013: -9.5, 2014: -17.0, 2015: -24.7, 2016: 11.8, 2017: 1.7,
+        2018: -11.2, 2019: 7.7, 2020: -3.1, 2021: 27.1, 2022: 16.1, 2023: -7.9, 2024: 5.4,
+        2025: 15.0,
+      },
+      approx: [1990, 1991, 1992, 1993, 2025],
+      enveloppes: { PEA: 'non', CTO: 'oui', AV: 'attention' },
+      notesEnveloppes: { AV: "Rares sont les contrats d'assurance-vie qui proposent un ETF matières premières : vérifiez le vôtre." },
+      fraisAnnuels: 0.3,
+      description: "Panier de pétrole, gaz, métaux industriels, métaux précieux et produits agricoles, via des contrats à terme.",
+      source: 'Bloomberg — Bloomberg Commodity Index Total Return (ex-DJ-UBS), en USD, converti en euros',
+      periode: '1990-2025',
+    },
+  },
+
+  /* Crises historiques rejouées dans l'onglet « Risques & crises ».
+     « annees » = années civiles de la crise (données annuelles).
+     « repere » = ordre de grandeur des chutes à l'intérieur de l'année,
+     invisibles en données annuelles (valeurs arrondies, indicatives). */
+  crises: [
+    { id: 'internet', nom: 'Bulle internet', annees: [2000, 2001, 2002], periode: '2000-2002',
+      repere: "Au pire moment (mars 2003), le CAC 40 avait perdu environ 65 % depuis son sommet de septembre 2000, hors dividendes." },
+    { id: 'subprimes', nom: 'Crise financière', annees: [2008], periode: '2008',
+      repere: "Du sommet d'octobre 2007 au creux de mars 2009, le MSCI World a perdu environ 55 % en dollars : plus que ce que montre l'année 2008 seule." },
+    { id: 'dette', nom: 'Crise de la dette européenne', annees: [2011], periode: '2011',
+      repere: "Entre février et septembre 2011, l'Euro Stoxx 50 a chuté d'environ 35 % avant de se reprendre en fin d'année." },
+    { id: 'covid', nom: 'Covid-19', annees: [2020], periode: '2020',
+      repere: "Entre le 19 février et le 23 mars 2020, le CAC 40 a perdu environ 38 % et le MSCI World environ 34 % (en dollars), puis tout a été effacé en quelques mois. Cette chute n'apparaît pas en données annuelles." },
+    { id: 'inflation', nom: 'Inflation et hausse des taux', annees: [2022], periode: '2022',
+      repere: "Fait rare : actions ET obligations ont baissé ensemble. Les obligations d'État de la zone euro ont perdu environ 18 % sur l'année." },
+  ],
+};
+</script>
+
+
+<!-- ===========================================================================
+     5. MOTEUR DE CALCUL — fonctions pures, sans accès à la page.
+     Ce bloc est aussi copié tel quel dans un Web Worker pour le Monte Carlo.
+     =========================================================================== -->
+<script id="moteur-calcul">
+/* Générateur pseudo-aléatoire reproductible (mulberry32) : même graine = mêmes
+   scénarios, pour que les résultats ne « sautent » pas d'un calcul à l'autre. */
+function creerAlea(graine) {
+  let a = graine >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* Facteur de croissance mensuel équivalent à un rendement annuel r et des frais
+   annuels f (en décimal) : 12 mois à ce facteur redonnent exactement (1+r)(1-f). */
+function facteurMensuel(rAnnuel, fraisAnnuels) {
+  return Math.pow((1 + rAnnuel) * (1 - fraisAnnuels), 1 / 12);
+}
+
+/* Pré-calcule, pour chaque année historique et chaque position, le facteur mensuel.
+   matrice[a][i] = rendement (décimal) de l'actif i l'année a. */
+function precalculerFacteurs(matrice, positions) {
+  const nA = matrice.length, nP = positions.length;
+  const f = new Float64Array(nA * nP);
+  for (let a = 0; a < nA; a++) {
+    for (let p = 0; p < nP; p++) f[a * nP + p] = facteurMensuel(matrice[a][positions[p].actif], positions[p].frais);
+  }
+  return f;
+}
+
+/* Simule une trajectoire mois par mois.
+   - seq      : indices des années historiques à enchaîner (une par année simulée)
+   - cfg      : { positions, capital, versementMensuel, hausseVersement, reequilibrage, plafondPEA }
+     positions[p] = { actif, poids, env (0 PEA, 1 CTO, 2 AV), groupe, estPEA, jumeau, jumeauDe, frais, fraisEntree }
+     Chaque ligne PEA a une position « jumelle » sur CTO qui reçoit les versements
+     au-delà du plafond du PEA.
+   - opts     : { twr: bool, mensuel: bool } pour les sorties facultatives
+   Hypothèses : versement en début de mois ; rendement annuel réparti uniformément
+   sur les 12 mois ; rééquilibrage (facultatif) le 31 décembre, réaliste :
+     1) à l'intérieur de chaque enveloppe, arbitrage vers les proportions cibles ;
+     2) entre enveloppes (on ne peut pas transférer d'un PEA vers une assurance-vie),
+        les versements de l'année suivante vont d'abord aux lignes en retard. */
+function simulerTrajectoire(seq, cfg, facteurs, opts) {
+  opts = opts || {};
+  const pos = cfg.positions, nP = pos.length, H = seq.length;
+  const v = new Float64Array(nP);   // valeur de chaque position
+  const b = new Float64Array(nP);   // montants versés (base de calcul des gains)
+  const plafond = cfg.plafondPEA > 0 ? cfg.plafondPEA : Infinity;
+  let versePEA = 0, totalVerse = 0, anneePlafond = -1, kCourant = 0;
+  // Répartition des versements de l'année en cours (au départ : les poids cibles)
+  const alloc = new Float64Array(nP);
+  for (let p = 0; p < nP; p++) alloc[p] = pos[p].jumeauDe >= 0 ? 0 : pos[p].poids;
+  // Groupes d'arbitrage : PEA, CTO, AV, et les « jumeaux » CTO des lignes PEA
+  const groupes = [];
+  for (let p = 0; p < nP; p++) (groupes[pos[p].groupe] || (groupes[pos[p].groupe] = [])).push(p);
+
+  const valeurs = new Float64Array(H + 1);
+  const verses = new Float64Array(H + 1);
+  const twr = opts.twr ? new Float64Array(H) : null;
+  const mens = opts.mensuel ? new Float64Array(H * 12 + 1) : null;       // valeur fin de mois
+  const indiceMens = opts.mensuel ? new Float64Array(H * 12 + 1) : null; // indice de performance (base 1)
+
+  // Répartit un versement entre les lignes selon leurs poids (respect du plafond PEA)
+  function verser(montant) {
+    if (!(montant > 0)) return;
+    totalVerse += montant;
+    for (let p = 0; p < nP; p++) {
+      const q = pos[p];
+      if (q.jumeauDe >= 0) continue;
+      const part = montant * alloc[p];
+      if (!(part > 0)) continue;
+      if (q.estPEA) {
+        const dispo = Math.max(0, plafond - versePEA);
+        const dansPEA = Math.min(part, dispo);
+        versePEA += dansPEA;
+        v[p] += dansPEA * (1 - q.fraisEntree); b[p] += dansPEA;
+        const reste = part - dansPEA;
+        if (reste > 1e-9) {
+          const j = q.jumeau;
+          v[j] += reste * (1 - pos[j].fraisEntree); b[j] += reste;
+          if (anneePlafond < 0) anneePlafond = kCourant;
+        }
+      } else {
+        v[p] += part * (1 - q.fraisEntree); b[p] += part;
+      }
+    }
+  }
+
+  // Rééquilibrage du 31 décembre.
+  // 1) Arbitrage à l'intérieur de chaque groupe : la valeur du groupe est
+  //    redistribuée selon les poids cibles relatifs. Les montants versés du
+  //    groupe (base fiscale) ne changent pas.
+  // 2) Versements de l'année suivante (montant annuel prochain) : ils comblent
+  //    d'abord l'écart de chaque ligne à sa cible, le reste suit les poids cibles.
+  function reequilibrer(versementAnnuelSuivant) {
+    for (const g of groupes) {
+      if (!g || g.length < 2) continue;
+      let tot = 0, pw = 0;
+      for (const p of g) { tot += v[p]; pw += pos[p].poids; }
+      if (tot <= 0 || pw <= 0) continue;
+      for (const p of g) v[p] = tot * pos[p].poids / pw;
+    }
+    if (!(versementAnnuelSuivant > 0)) return;
+    let T = 0;
+    for (let p = 0; p < nP; p++) T += v[p];
+    const cibleTotale = T + versementAnnuelSuivant;
+    let sommeEcarts = 0;
+    for (let p = 0; p < nP; p++) {
+      const q = pos[p];
+      if (q.jumeauDe >= 0) { alloc[p] = 0; continue; }
+      const actuel = v[p] + (q.jumeau >= 0 ? v[q.jumeau] : 0);
+      alloc[p] = Math.max(0, q.poids * cibleTotale - actuel);
+      sommeEcarts += alloc[p];
+    }
+    for (let p = 0; p < nP; p++) {
+      if (pos[p].jumeauDe >= 0) continue;
+      alloc[p] = sommeEcarts >= versementAnnuelSuivant
+        ? alloc[p] / sommeEcarts
+        : (alloc[p] + (versementAnnuelSuivant - sommeEcarts) * pos[p].poids) / versementAnnuelSuivant;
+    }
+  }
+
+  verser(cfg.capital);
+  let total = 0;
+  for (let p = 0; p < nP; p++) total += v[p];
+  valeurs[0] = total; verses[0] = totalVerse;
+  let indice = 1;
+  if (mens) { mens[0] = total; indiceMens[0] = 1; }
+
+  for (let k = 0; k < H; k++) {
+    kCourant = k;
+    const base = seq[k] * nP;
+    const versement = cfg.versementMensuel * Math.pow(1 + cfg.hausseVersement, k);
+    let produit = 1;
+    for (let m = 0; m < 12; m++) {
+      verser(versement);
+      let avant = 0, apres = 0;
+      for (let p = 0; p < nP; p++) { avant += v[p]; v[p] *= facteurs[base + p]; apres += v[p]; }
+      if (avant > 0) { const r = apres / avant; produit *= r; indice *= r; }
+      total = apres;
+      if (mens) { mens[k * 12 + m + 1] = total; indiceMens[k * 12 + m + 1] = indice; }
+    }
+    if (twr) twr[k] = produit - 1;
+    if (cfg.reequilibrage) {
+      reequilibrer(12 * cfg.versementMensuel * Math.pow(1 + cfg.hausseVersement, k + 1));
+      total = 0; for (let p = 0; p < nP; p++) total += v[p];
+    }
+    valeurs[k + 1] = total; verses[k + 1] = totalVerse;
+  }
+  return { valeurs, verses, twr, mens, indiceMens, v, b, versePEA, anneePlafond };
+}
+
+/* Séquence d'années tirées par blocs (bootstrap par blocs circulaire) :
+   on choisit une année de départ au hasard, on prend « bloc » années consécutives
+   (on revient à 1990 après 2025), et on recommence jusqu'à l'horizon. */
+function sequenceBootstrap(H, nAnnees, bloc, alea) {
+  const seq = new Int32Array(H);
+  let k = 0;
+  while (k < H) {
+    const depart = Math.floor(alea() * nAnnees);
+    for (let j = 0; j < bloc && k < H; j++, k++) seq[k] = (depart + j) % nAnnees;
+  }
+  return seq;
+}
+
+/* Percentile d'un tableau DÉJÀ TRIÉ (interpolation linéaire). p entre 0 et 1. */
+function percentileTrie(trie, p) {
+  const n = trie.length;
+  if (!n) return NaN;
+  const x = (n - 1) * p, i = Math.floor(x), f = x - i;
+  return i + 1 < n ? trie[i] + (trie[i + 1] - trie[i]) * f : trie[i];
+}
+function percentile(valeurs, p) {
+  return percentileTrie(Float64Array.from(valeurs).sort(), p);
+}
+
+/* Monte Carlo complet (exécuté dans le Web Worker). */
+function executerMonteCarlo(params) {
+  const cfg = {
+    positions: params.positions, capital: params.capital, versementMensuel: params.versementMensuel,
+    hausseVersement: params.hausseVersement, reequilibrage: params.reequilibrage, plafondPEA: params.plafondPEA,
+  };
+  const matrice = params.matrice, H = params.horizon, N = params.nSim, nA = matrice.length;
+  const facteurs = precalculerFacteurs(matrice, cfg.positions);
+  const alea = creerAlea(params.graine);
+  const parAnnee = new Float64Array(N * (H + 1));  // [année k][scénario s]
+  const env = new Float64Array(N * 6);             // par scénario : PEA val/versé, CTO val/versé, AV val/versé
+  const plafonds = new Int16Array(N);              // année où le plafond du PEA est atteint (-1 : jamais)
+  let verses = null;
+
+  for (let s = 0; s < N; s++) {
+    const seq = sequenceBootstrap(H, nA, params.bloc, alea);
+    const t = simulerTrajectoire(seq, cfg, facteurs, null);
+    for (let k = 0; k <= H; k++) parAnnee[k * N + s] = t.valeurs[k];
+    for (let p = 0; p < cfg.positions.length; p++) {
+      const e = cfg.positions[p].env;
+      env[s * 6 + e * 2] += t.v[p];
+      env[s * 6 + e * 2 + 1] += t.b[p];
+    }
+    plafonds[s] = t.anneePlafond;
+    if (!verses) verses = Array.from(t.verses);
+  }
+
+  // Percentiles année par année (pour le graphique en éventail)
+  const niveaux = [0.10, 0.25, 0.50, 0.75, 0.90];
+  const bandes = niveaux.map(() => new Array(H + 1));
+  for (let k = 0; k <= H; k++) {
+    const col = parAnnee.slice(k * N, (k + 1) * N).sort();
+    niveaux.forEach((p, i) => { bandes[i][k] = percentileTrie(col, p); });
+  }
+
+  // Scénarios représentatifs : on classe les scénarios par valeur finale
+  const ordre = new Uint32Array(N);
+  for (let s = 0; s < N; s++) ordre[s] = s;
+  const fin = parAnnee.subarray(H * N, (H + 1) * N);
+  ordre.sort((a, b) => fin[a] - fin[b]);
+  const scenarios = niveaux.map(p => {
+    const s = ordre[Math.round(p * (N - 1))];
+    return {
+      percentile: p, total: fin[s], verse: verses[H], anneePlafond: plafonds[s],
+      enveloppes: {
+        PEA: { valeur: env[s * 6], verse: env[s * 6 + 1] },
+        CTO: { valeur: env[s * 6 + 2], verse: env[s * 6 + 3] },
+        AV:  { valeur: env[s * 6 + 4], verse: env[s * 6 + 5] },
+      },
+    };
+  });
+
+  let sousVerse = 0, somme = 0, avecPlafond = 0;
+  for (let s = 0; s < N; s++) { if (fin[s] < verses[H]) sousVerse++; somme += fin[s]; if (plafonds[s] >= 0) avecPlafond++; }
+  return { bandes, niveaux, verses, scenarios, probaSousVerse: sousVerse / N, moyenne: somme / N, nSim: N, horizon: H, probaPlafond: avecPlafond / N };
+}
+
+/* ------------------------- Statistiques de risque ------------------------- */
+function moyenne(a) { let s = 0; for (const x of a) s += x; return a.length ? s / a.length : NaN; }
+function ecartType(a) {   // écart-type « échantillon » (n-1)
+  if (a.length < 2) return NaN;
+  const m = moyenne(a); let s = 0;
+  for (const x of a) s += (x - m) * (x - m);
+  return Math.sqrt(s / (a.length - 1));
+}
+/* Rendement annualisé (moyenne géométrique) d'une série de rendements annuels. */
+function rendementAnnualise(rendements) {
+  let p = 1;
+  for (const r of rendements) p *= 1 + r;
+  return rendements.length ? Math.pow(p, 1 / rendements.length) - 1 : NaN;
+}
+/* Ratio de Sharpe : excès de rendement moyen / volatilité de cet excès. */
+function ratioSharpe(rendements, sansRisque) {
+  const exces = rendements.map((r, i) => r - sansRisque[i]);
+  return moyenne(exces) / ecartType(exces);
+}
+/* Perte maximale (drawdown) d'une série de valeurs (indice de performance).
+   Renvoie la perte (négative), l'indice du sommet, du creux, et du retour au
+   niveau du sommet (-1 si pas encore revenu). */
+function analyserDrawdown(serie) {
+  let pic = serie[0], iPicCourant = 0, max = 0, iPic = 0, iCreux = 0;
+  for (let i = 1; i < serie.length; i++) {
+    if (serie[i] > pic) { pic = serie[i]; iPicCourant = i; }
+    const dd = serie[i] / pic - 1;
+    if (dd < max) { max = dd; iPic = iPicCourant; iCreux = i; }
+  }
+  let iRetour = -1;
+  if (max < 0) {
+    for (let i = iCreux + 1; i < serie.length; i++) if (serie[i] >= serie[iPic] * (1 - 1e-12)) { iRetour = i; break; }
+  }
+  return { max, iPic, iCreux, iRetour };
+}
+/* Série des baisses depuis le dernier sommet (pour le graphique « sous l'eau »). */
+function serieDrawdown(serie) {
+  let pic = -Infinity;
+  return Array.from(serie, x => { if (x > pic) pic = x; return x / pic - 1; });
+}
+</script>
+
+
+<!-- ===========================================================================
+     6. FISCALITÉ — fonctions pures
+     =========================================================================== -->
+<script id="fiscalite">
+/* Impôts dus en cas de retrait total, enveloppe par enveloppe.
+   env  : { PEA: {valeur, verse}, CTO: {...}, AV: {...} }
+   opts : { dureePEA, dureeAV (années de détention au moment du retrait), situation: 'celibataire'|'couple' }
+   P    : PARAMETRES_FISCAUX
+   Le gain imposable = valeur - montants versés (0 en cas de perte). */
+function calculerFiscalite(env, opts, P) {
+  const res = {};
+  const psCapital = P.prelevementsSociaux, psAV = P.prelevementsSociauxAssuranceVie, pfu = P.pfuImpotRevenu;
+
+  // PEA : PFU avant 5 ans (le retrait clôture le plan), seulement les prélèvements sociaux après
+  {
+    const { valeur, verse } = env.PEA; const gain = Math.max(0, valeur - verse);
+    const apres = opts.dureePEA >= P.pea.dureeExoneration;
+    const ir = apres ? 0 : gain * pfu, ps = gain * psCapital;
+    res.PEA = { valeur, verse, gain: valeur - verse, ir, ps, impot: ir + ps, net: valeur - ir - ps, apres };
+  }
+  // CTO : prélèvement forfaitaire unique (impôt 12,8 % + prélèvements sociaux)
+  {
+    const { valeur, verse } = env.CTO; const gain = Math.max(0, valeur - verse);
+    const ir = gain * pfu, ps = gain * psCapital;
+    res.CTO = { valeur, verse, gain: valeur - verse, ir, ps, impot: ir + ps, net: valeur - ir - ps };
+  }
+  // Assurance-vie (versements après le 27/09/2017)
+  {
+    const { valeur, verse } = env.AV; const gain = Math.max(0, valeur - verse);
+    const A = P.assuranceVie, apres = opts.dureeAV >= A.dureeAvantage;
+    const ps = gain * psAV;
+    let ir, abattement = 0;
+    if (!apres) ir = gain * pfu;
+    else {
+      abattement = opts.situation === 'couple' ? A.abattementCouple : A.abattementCelibataire;
+      const base = Math.max(0, gain - abattement);
+      // Taux réduit sur la part des gains correspondant aux versements jusqu'au seuil (150 000 €)
+      const partReduite = verse > 0 ? Math.min(1, A.seuilVersements / verse) : 1;
+      ir = base * partReduite * A.tauxReduitApres8Ans + base * (1 - partReduite) * pfu;
+    }
+    res.AV = { valeur, verse, gain: valeur - verse, ir, ps, impot: ir + ps, net: valeur - ir - ps, apres, abattement: Math.min(abattement, gain) };
+  }
+  const t = { valeur: 0, verse: 0, gain: 0, ir: 0, ps: 0, impot: 0, net: 0 };
+  for (const e of ['PEA', 'CTO', 'AV']) for (const k in t) t[k] += res[e][k];
+  res.total = t;
+  return res;
+}
+</script>
+
+
+<!-- ===========================================================================
+     7. INTERFACE
+     =========================================================================== -->
+<script>
+'use strict';
+
+/* ============================ Préparation des données ============================ */
+
+/* Convertit chaque actif en rendements annuels EN EUROS (décimaux). */
+function preparerMarche(d) {
+  const fx = d.eurusd.niveaux;
+  const actifs = {};
+  for (const [id, a] of Object.entries(d.actifs)) {
+    const r = {};
+    if (a.rendements) {
+      for (const [an, x] of Object.entries(a.rendements)) r[an] = x / 100;
+    } else if (a.niveaux) {
+      for (const an of Object.keys(a.niveaux).map(Number)) {
+        if (a.niveaux[an - 1] == null) continue;
+        r[an] = a.niveaux[an] / a.niveaux[an - 1] - 1 + ((a.dividendes && a.dividendes[an]) || 0) / 100;
+      }
+    }
+    if (a.devise === 'USD') {   // conversion : (1 + r$) × (EURUSD début / EURUSD fin) − 1
+      for (const an of Object.keys(r)) {
+        if (fx[an] == null || fx[an - 1] == null) delete r[an];
+        else r[an] = (1 + r[an]) * fx[an - 1] / fx[an] - 1;
+      }
+    }
+    const approx = new Set(a.approx === 'toutes' ? Object.keys(r).map(Number) : (a.approx || []));
+    if (a.devise === 'USD') for (const an of d.eurusd.approx) if (r[an] != null) approx.add(an);
+    actifs[id] = Object.assign({}, a, { id, r, approx });
+  }
+  const rf = {};
+  for (const [an, x] of Object.entries(d.tauxSansRisque.valeurs)) rf[an] = x / 100;
+  return { actifs, rf, ids: Object.keys(actifs) };
+}
+const MARCHE = preparerMarche(DONNEES_MARCHE);
+
+/* Années pour lesquelles TOUS les actifs demandés ont une donnée. */
+function anneesCommunes(ids) {
+  let annees = null;
+  for (const id of ids) {
+    const a = Object.keys(MARCHE.actifs[id].r).map(Number);
+    annees = annees ? annees.filter(x => a.includes(x)) : a;
+  }
+  return (annees || []).sort((x, y) => x - y);
+}
+
+const CLASSES = ['Actions', 'Obligations', 'Fonds euros', 'Immobilier', 'Or & matières premières'];
+const ENVELOPPES = { PEA: 'PEA', CTO: 'Compte-titres (CTO)', AV: 'Assurance-vie' };
+const ENVELOPPES_COURTES = { PEA: 'PEA', CTO: 'CTO', AV: 'Assurance-vie' };
+const ZONES = ['Amérique du Nord', 'Europe (hors France)', 'France', 'Asie-Pacifique développée', 'Pays émergents', 'Mondial (sans zone)'];
+// Palette catégorielle validée (ordre fixe, jamais recyclé)
+const SERIES = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948'];
+const C = { accent: '#2a78d6', ref: '#eb6834', verse: '#8a8f9c', gain: '#0ca30c', perte: '#d03b3b', grille: '#eef0f4' };
+
+/* ================================ État ================================ */
+let compteurLignes = 0;
+const etat = {
+  modeSaisie: PORTEFEUILLE_PAR_DEFAUT.modeSaisie,
+  capital: PORTEFEUILLE_PAR_DEFAUT.capitalDepart,
+  versementMensuel: PORTEFEUILLE_PAR_DEFAUT.versementMensuel,
+  hausseVersement: PORTEFEUILLE_PAR_DEFAUT.hausseAnnuelleVersement,
+  horizon: Math.min(40, Math.max(1, PORTEFEUILLE_PAR_DEFAUT.horizonAnnees)),
+  reequilibrage: PORTEFEUILLE_PAR_DEFAUT.reequilibrageAnnuel,
+  lignes: PORTEFEUILLE_PAR_DEFAUT.lignes.map(l => ({ id: ++compteurLignes, actif: l.actif, valeur: Number(l.valeur) || 0, enveloppe: l.enveloppe })),
+  historique: { debut: PORTEFEUILLE_PAR_DEFAUT.historique.anneeDebut, fin: PORTEFEUILLE_PAR_DEFAUT.historique.anneeFin, reference: PORTEFEUILLE_PAR_DEFAUT.historique.reference },
+  projection: { nSim: Math.max(5000, PORTEFEUILLE_PAR_DEFAUT.projection.nombreScenarios), bloc: PORTEFEUILLE_PAR_DEFAUT.projection.longueurBloc, graine: PORTEFEUILLE_PAR_DEFAUT.projection.graine },
+  fiscalite: Object.assign({}, PORTEFEUILLE_PAR_DEFAUT.fiscalite),
+};
+let resultatMC = null;     // dernier résultat Monte Carlo
+let resultatRisque = null; // derniers indicateurs de risque
+
+/* ============================== Formats ============================== */
+const _nf = {};
+function nf(opts) { const k = JSON.stringify(opts); return _nf[k] || (_nf[k] = new Intl.NumberFormat('fr-FR', opts)); }
+function fmtEuro(v, dec = 2) {
+  if (!isFinite(v)) return '—';
+  return nf({ style: 'currency', currency: 'EUR', minimumFractionDigits: dec, maximumFractionDigits: dec }).format(v);
+}
+function fmtNombre(v, dec = 1) { return isFinite(v) ? nf({ minimumFractionDigits: dec, maximumFractionDigits: dec }).format(v) : '—'; }
+function fmtPct(v, dec = 1, signe = false) {   // v en décimal : 0.052 → « 5,2 % »
+  if (!isFinite(v)) return '—';
+  return nf({ minimumFractionDigits: dec, maximumFractionDigits: dec, signDisplay: signe ? 'exceptZero' : 'auto' }).format(v * 100) + ' %';
+}
+function fmtCompact(v) {
+  const a = Math.abs(v);
+  if (a >= 1e6) return fmtNombre(v / 1e6, a >= 1e7 ? 0 : 1) + ' M€';
+  if (a >= 1e3) return fmtNombre(v / 1e3, 0) + ' k€';
+  return fmtNombre(v, 0) + ' €';
+}
+function fmtDuree(mois) {
+  if (mois == null || !isFinite(mois)) return '—';
+  mois = Math.round(mois);
+  if (mois <= 0) return 'moins d’un mois';
+  const a = Math.floor(mois / 12), m = mois % 12;
+  const pa = a ? `${a} an${a > 1 ? 's' : ''}` : '', pm = m ? `${m} mois` : '';
+  return pa && pm ? `${pa} et ${pm}` : pa || pm;
+}
+function fmtAns(n) { return `${n} an${n > 1 ? 's' : ''}`; }
+const MOIS = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
+/* Libellé de la fin du mois i d'une série mensuelle démarrant le 1er janvier de anneeDebut. */
+function libelleMois(anneeDebut, i) {
+  if (i === 0) return `début ${anneeDebut}`;
+  const an = anneeDebut + Math.floor((i - 1) / 12), m = (i - 1) % 12;
+  return m === 11 ? `fin ${an}` : `fin ${MOIS[m]} ${an}`;
+}
+/* « vers mars 2012 » ou « vers fin 2010 » */
+function vers(anneeDebut, i) { const l = libelleMois(anneeDebut, i); return 'vers ' + (/^fin \d/.test(l) ? l : l.replace('fin ', '')); }
+function classeSigne(v) { return v > 0.005 ? 'positif' : v < -0.005 ? 'negatif' : ''; }
+function echap(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const aide = cle => `<button class="aide" type="button" data-aide="${cle}">?</button>`;
+
+/* ============================ Textes d'aide « ? » ============================ */
+function textesAide() {
+  const P = PARAMETRES_FISCAUX, pfuCapital = P.pfuImpotRevenu + P.prelevementsSociaux;
+  return {
+    capital: "La somme placée dès le départ. Ex. : 10 000 € investis aujourd'hui, répartis selon vos lignes.",
+    versement: "La somme ajoutée chaque mois. Ex. : 200 € par mois = 2 400 € par an, soit 48 000 € en 20 ans.",
+    hausse: "Augmente vos versements chaque année, par exemple pour suivre votre salaire. Ex. : 200 €/mois avec +2 % → 204 €/mois l'année suivante.",
+    horizon: "Le nombre d'années pendant lesquelles vous laissez l'argent travailler avant de tout retirer. Ex. : 20 ans.",
+    reequilibrage: "Une fois par an, on revient vers les proportions choisies : dans chaque enveloppe, on vend ce qui a monté pour racheter ce qui a baissé ; entre enveloppes (impossible de transférer d'un PEA vers une assurance-vie), on oriente les versements de l'année suivante vers ce qui est en retard. Ex. : un 80/20 devenu 85/15 est ramené vers 80/20.",
+    modeSaisie: "En %, vous donnez la part de chaque ligne et le capital de départ. En €, vous donnez le montant de chaque ligne : le capital de départ est leur somme. Ex. : 6 000 € + 4 000 € = 10 000 €, soit 60 % / 40 %.",
+    enveloppe: `Le « compte » qui héberge le placement. Il change surtout les impôts. Ex. : 10 000 € de gain coûtent ${fmtEuro(10000 * pfuCapital, 0)} sur un compte-titres, mais ${fmtEuro(10000 * P.prelevementsSociaux, 0)} sur un PEA de plus de 5 ans.`,
+    mediane: "La valeur au milieu de tous les scénarios simulés : une chance sur deux de faire mieux, une sur deux de faire moins bien. Ex. : médiane de 100 000 € = 1 scénario sur 2 dépasse 100 000 €.",
+    totalVerse: "La somme de votre capital de départ et de tous vos versements mensuels jusqu'à l'horizon. Ex. : 10 000 € + 200 €/mois pendant 10 ans = 34 000 € (sans hausse des versements).",
+    gain: "La différence entre la valeur finale et ce que vous avez versé, avant impôts. Ex. : 50 000 € obtenus pour 34 000 € versés = 16 000 € de gain.",
+    drawdown: "La pire baisse entre un sommet et le point bas qui suit. Ex. : un portefeuille qui passe de 20 000 € à 12 000 € a une perte maximale de 40 %.",
+    backtest: "On rejoue le passé : votre portefeuille et vos versements sont appliqués aux vraies performances annuelles des marchés. Ex. : 10 000 € placés sur le MSCI World début 2000.",
+    reference: "Un placement simple servant de point de comparaison, avec le même capital et les mêmes versements. Ex. : tout sur le MSCI World.",
+    twr: "La performance moyenne par an, calculée sans être faussée par le calendrier de vos versements. Ex. : +5 %/an pendant 10 ans transforment 10 000 € en 16 289 €.",
+    montecarlo: "On simule des milliers d'avenirs possibles en réutilisant, dans un ordre aléatoire, de vraies années de marché passées. Ex. : 5 000 scénarios sur 20 ans.",
+    bootstrap: "« Bootstrap par blocs » : on pioche au hasard des morceaux de plusieurs années consécutives de l'histoire réelle. Ex. : un bloc 2007-2011 garde l'enchaînement krach 2008 puis rebond 2009.",
+    bloc: "Nombre d'années consécutives tirées ensemble. Des blocs longs gardent mieux les enchaînements réels (krach puis rebond) ; 1 an les mélange complètement. Ex. : bloc de 5 ans = 2008-2012 d'un seul tenant.",
+    percentile: "Le percentile 10 est la valeur sous laquelle se trouvent 10 % des scénarios. Ex. : P10 = 60 000 € veut dire que 9 scénarios sur 10 font mieux que 60 000 €.",
+    eventail: "Chaque bande montre où se situent les scénarios année après année. Plus l'éventail s'ouvre, plus l'incertitude grandit. Ex. : à 20 ans, 8 scénarios sur 10 sont dans la zone claire.",
+    rendement: "Le gain moyen par an, intérêts composés inclus. Ex. : 10 000 € devenus 16 289 € en 10 ans = 5 % par an.",
+    volatilite: "L'ampleur habituelle des variations d'une année à l'autre. Ex. : rendement moyen 7 % et volatilité 15 % → environ 2 années sur 3 entre −8 % et +22 %.",
+    pireAnnee: "La plus forte baisse sur une année civile (1er janvier au 31 décembre). Ex. : −25 % = 10 000 € au 1er janvier, 7 500 € au 31 décembre.",
+    recuperation: "Le temps qu'il a fallu, depuis le sommet, pour retrouver ce niveau. Ex. : sommet fin 2007, retour fin 2010 = 3 ans.",
+    sharpe: `Le rendement obtenu au-dessus d'un placement sans risque, divisé par la volatilité : ce que chaque unité de risque a rapporté. Ex. : (7 % − 2 %) / 10 % = 0,5. Au-dessus de 0,5 c'est correct, au-dessus de 1 c'est excellent.`,
+    crise: "On rejoue votre portefeuille actuel, sans nouveaux versements, pendant une vraie crise, puis dans les années qui ont suivi. Ex. : 10 000 € au 1er janvier 2008.",
+    abattement: `Après ${P.assuranceVie.dureeAvantage} ans, les gains retirés d'une assurance-vie sont exonérés d'impôt sur le revenu jusqu'à ${fmtEuro(P.assuranceVie.abattementCelibataire, 0)} par an (${fmtEuro(P.assuranceVie.abattementCouple, 0)} pour un couple). Ex. : 6 000 € de gain → impôt sur 1 400 € seulement.`,
+    anciennete: `Si votre PEA ou votre assurance-vie est déjà ouvert, indiquez son âge : c'est la date d'ouverture qui compte pour les délais de ${P.pea.dureeExoneration} et ${P.assuranceVie.dureeAvantage} ans. Ex. : PEA ouvert il y a 3 ans + horizon de 2 ans = 5 ans.`,
+    pfu: `Prélèvement forfaitaire unique (« flat tax ») : ${fmtPct(P.pfuImpotRevenu)} d'impôt + ${fmtPct(P.prelevementsSociaux)} de prélèvements sociaux = ${fmtPct(pfuCapital)}. Ex. : 1 000 € de gain → ${fmtEuro(1000 * pfuCapital, 0)} d'impôts.`,
+    ps: `Contributions (CSG, CRDS…) dues sur les gains quelle que soit l'enveloppe : ${fmtPct(P.prelevementsSociaux)} (PEA, CTO) ou ${fmtPct(P.prelevementsSociauxAssuranceVie)} (assurance-vie). Ex. : 1 000 € de gain sur un PEA → ${fmtEuro(1000 * P.prelevementsSociaux, 0)}.`,
+    plafondPEA: `Vous ne pouvez pas verser plus de ${fmtEuro(P.pea.plafondVersements, 0)} sur un PEA (les gains, eux, ne sont pas plafonnés). Ex. : 500 €/mois atteignent le plafond en 25 ans.`,
+    etf: "Un ETF (ou « tracker ») est un fonds coté qui copie un indice pour des frais faibles (0,1 à 0,4 %/an). Les ETF « éligibles PEA » répliquent des indices mondiaux grâce à un mécanisme d'échange (réplication synthétique).",
+    frais: `Les rendements sont diminués des frais annuels des fonds (ETF) et, en assurance-vie, de ${fmtNombre(HYPOTHESES.fraisGestionAssuranceVieUC, 1)} % de frais de gestion sur les unités de compte. Ex. : 7 % de rendement − 0,2 % de frais = 6,8 %.`,
+    inflation: `La hausse des prix réduit ce que vous pourrez acheter demain. Ex. : avec ${fmtNombre(HYPOTHESES.inflationAnnuelle, 1)} % d'inflation par an, 100 000 € dans 20 ans valent environ ${fmtEuro(100000 / Math.pow(1 + HYPOTHESES.inflationAnnuelle / 100, 20), 0)} d'aujourd'hui.`,
+  };
+}
+const AIDES = textesAide();
+
+/* Bulle d'aide unique, positionnée dans l'écran (souris, clavier et tactile). */
+function installerBulles() {
+  const bulle = $('#bulle');
+  let cible = null;
+  function montrer(el) {
+    const t = AIDES[el.dataset.aide];
+    if (!t) return;
+    cible = el;
+    bulle.textContent = t;
+    bulle.classList.add('visible');
+    const r = el.getBoundingClientRect(), w = bulle.offsetWidth, h = bulle.offsetHeight;
+    let x = r.left + r.width / 2 - w / 2;
+    x = Math.max(8, Math.min(x, window.innerWidth - w - 8));
+    let y = r.bottom + 8;
+    if (y + h > window.innerHeight - 40) y = r.top - h - 8;
+    bulle.style.left = x + 'px'; bulle.style.top = Math.max(8, y) + 'px';
+  }
+  function cacher() { cible = null; bulle.classList.remove('visible'); }
+  document.addEventListener('mouseover', e => { const el = e.target.closest('.aide'); if (el) montrer(el); });
+  document.addEventListener('mouseout', e => { if (e.target.closest('.aide')) cacher(); });
+  document.addEventListener('focusin', e => { const el = e.target.closest('.aide'); if (el) montrer(el); });
+  document.addEventListener('focusout', e => { if (e.target.closest('.aide')) cacher(); });
+  document.addEventListener('click', e => {
+    const el = e.target.closest('.aide');
+    if (el) { e.preventDefault(); e.stopPropagation(); if (cible === el) cacher(); else montrer(el); }
+    else cacher();
+  }, true);
+  window.addEventListener('scroll', cacher, { passive: true });
+}
+
+/* ============================ Graphiques (Chart.js) ============================ */
+const graphiques = {};
+const chartDisponible = typeof window.Chart !== 'undefined';
+if (chartDisponible) {
+  Chart.defaults.font.family = "'Inter', system-ui, sans-serif";
+  Chart.defaults.font.size = 12;
+  Chart.defaults.color = '#6b7280';
+  Chart.defaults.maintainAspectRatio = false;
+  Chart.defaults.animation.duration = 300;
+  Chart.defaults.plugins.legend.labels.usePointStyle = true;
+  Chart.defaults.plugins.legend.labels.boxWidth = 8;
+  Chart.defaults.plugins.legend.labels.padding = 14;
+  Chart.defaults.plugins.tooltip.backgroundColor = '#0f172a';
+  Chart.defaults.plugins.tooltip.padding = 10;
+  Chart.defaults.plugins.tooltip.cornerRadius = 10;
+  Chart.defaults.plugins.tooltip.boxPadding = 4;
+}
+function dessiner(id, config) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  if (!chartDisponible) {
+    canvas.parentElement.innerHTML = '<div class="sans-graph">Graphique indisponible : la bibliothèque Chart.js n\'a pas pu être chargée (connexion internet nécessaire).</div>';
+    return;
+  }
+  if (graphiques[id]) graphiques[id].destroy();
+  graphiques[id] = new Chart(canvas, config);
+}
+function axeEuros() { return { grid: { color: C.grille }, border: { display: false }, ticks: { callback: v => fmtCompact(v) } }; }
+function axePct() { return { grid: { color: C.grille }, border: { display: false }, ticks: { callback: v => fmtNombre(v, 0) + ' %' } }; }
+const axeX = { grid: { display: false }, ticks: { maxRotation: 0, autoSkipPadding: 12 } };
+
+/* ============================ Configuration du calcul ============================ */
+
+/* Lignes valides, poids normalisés (somme = 1) et capital de départ. */
+function lignesNormalisees() {
+  const lignes = etat.lignes.filter(l => MARCHE.actifs[l.actif] && l.valeur > 0);
+  const somme = lignes.reduce((s, l) => s + l.valeur, 0);
+  const capital = etat.modeSaisie === 'montant' ? somme : Math.max(0, etat.capital || 0);
+  if (!lignes.length || somme <= 0) return { ok: false, lignes: [], somme: 0, capital };
+  return { ok: true, somme, capital, lignes: lignes.map(l => ({ actif: l.actif, enveloppe: l.enveloppe, poids: l.valeur / somme })) };
+}
+
+/* Construit la configuration du moteur pour des lignes et des années données. */
+function construireConfig(ln, annees, surcharges) {
+  const ids = [...new Set(ln.lignes.map(l => l.actif))];
+  const matrice = annees.map(an => ids.map(id => MARCHE.actifs[id].r[an]));
+  const idxEnv = { PEA: 0, CTO: 1, AV: 2 };
+  const positions = ln.lignes.map(l => {
+    const a = MARCHE.actifs[l.actif];
+    let frais = (a.fraisAnnuels || 0) / 100;
+    if (l.enveloppe === 'AV' && a.classe !== 'Fonds euros') frais += HYPOTHESES.fraisGestionAssuranceVieUC / 100;
+    return { actif: ids.indexOf(l.actif), poids: l.poids, env: idxEnv[l.enveloppe], groupe: idxEnv[l.enveloppe], estPEA: l.enveloppe === 'PEA', jumeau: -1, jumeauDe: -1, frais, fraisEntree: (a.fraisEntree || 0) / 100 };
+  });
+  const n = positions.length;
+  for (let p = 0; p < n; p++) {
+    if (!positions[p].estPEA) continue;
+    positions.push(Object.assign({}, positions[p], { estPEA: false, env: 1, groupe: 3, jumeauDe: p, jumeau: -1 }));
+    positions[p].jumeau = positions.length - 1;
+  }
+  const cfg = Object.assign({
+    positions, capital: ln.capital, versementMensuel: etat.versementMensuel || 0,
+    hausseVersement: (etat.hausseVersement || 0) / 100, reequilibrage: etat.reequilibrage,
+    plafondPEA: PARAMETRES_FISCAUX.pea.plafondVersements,
+  }, surcharges || {});
+  return { cfg, matrice, ids, facteurs: precalculerFacteurs(matrice, positions) };
+}
+const lnReference = (ln, ref) => ({ ok: true, capital: ln.capital, lignes: [{ actif: ref, enveloppe: 'CTO', poids: 1 }] });
+const idsDe = ln => [...new Set(ln.lignes.map(l => l.actif))];
+
+/* =============================== Onglets =============================== */
+function installerOnglets() {
+  $$('.onglet').forEach(b => b.addEventListener('click', () => {
+    $$('.onglet').forEach(x => x.setAttribute('aria-selected', String(x === b)));
+    $$('.panneau').forEach(p => { p.hidden = p.id !== 'p-' + b.dataset.onglet; });
+  }));
+}
+
+/* ============================ Lignes du portefeuille ============================ */
+function optionsActifs(sel) {
+  return CLASSES.map(cl => {
+    const opts = MARCHE.ids.filter(id => MARCHE.actifs[id].classe === cl)
+      .map(id => `<option value="${id}" ${id === sel ? 'selected' : ''}>${echap(MARCHE.actifs[id].nomCourt)}</option>`).join('');
+    return opts ? `<optgroup label="${echap(cl)}">${opts}</optgroup>` : '';
+  }).join('');
+}
+
+/* Message de compatibilité actif / enveloppe. */
+function messageCompatibilite(l) {
+  const a = MARCHE.actifs[l.actif];
+  if (!a) return '';
+  const statut = (a.enveloppes && a.enveloppes[l.enveloppe]) || 'oui';
+  const note = a.notesEnveloppes && a.notesEnveloppes[l.enveloppe];
+  if (statut === 'non') {
+    const t = note || (l.enveloppe === 'PEA'
+      ? `Incompatible : le PEA n'accepte que des actions européennes et des fonds ou ETF éligibles (au moins 75 % d'actions européennes). ${a.nomCourt} n'y est pas éligible.`
+      : `Incompatible : ${a.nomCourt} ne peut pas être logé dans cette enveloppe.`);
+    return `<div class="msg erreur">⚠️ ${echap(t)} Choisissez une autre enveloppe.</div>`;
+  }
+  if (statut === 'etf') return `<div class="msg info">ℹ️ Éligible au PEA uniquement via un ETF « éligible PEA » (réplication synthétique) ${aide('etf')}</div>`;
+  if (statut === 'attention') return `<div class="msg attention">⚠️ ${echap(note || 'Vérifiez que votre contrat propose ce support.')}</div>`;
+  return '';
+}
+
+function rendreLignes() {
+  const suffixe = etat.modeSaisie === 'pourcentage' ? '%' : '€';
+  $('#lignes').innerHTML = etat.lignes.map(l => `
+    <div class="ligne" data-id="${l.id}">
+      <label class="champ champ-actif"><span>Actif</span><select data-l="actif">${optionsActifs(l.actif)}</select></label>
+      <label class="champ"><span>${etat.modeSaisie === 'pourcentage' ? 'Part' : 'Montant'}</span>
+        <div class="suffixe"><input type="number" min="0" step="${etat.modeSaisie === 'pourcentage' ? 1 : 100}" value="${l.valeur}" data-l="valeur" inputmode="decimal"><em>${suffixe}</em></div></label>
+      <label class="champ"><span>Enveloppe</span><select data-l="enveloppe">
+        ${Object.entries(ENVELOPPES_COURTES).map(([k, n]) => `<option value="${k}" ${k === l.enveloppe ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
+      <button type="button" class="btn-suppr" data-suppr aria-label="Supprimer la ligne" title="Supprimer">×</button>
+      <div class="msg-zone" style="grid-column:1/-1">${messageCompatibilite(l)}</div>
+    </div>`).join('') || '<p class="note">Aucune ligne : ajoutez un actif pour commencer.</p>';
+  majTotalLignes();
+}
+
+function majTotalLignes() {
+  const somme = etat.lignes.reduce((s, l) => s + (l.valeur > 0 ? l.valeur : 0), 0);
+  const alertes = [];
+  if (etat.modeSaisie === 'pourcentage') {
+    const ok = Math.abs(somme - 100) < 0.01;
+    $('#total-lignes').innerHTML = `Total : <span class="${ok ? 'positif' : 'negatif'}">${fmtNombre(somme, somme % 1 ? 1 : 0)} %</span>`;
+    if (!ok && somme > 0) alertes.push(`<div class="msg attention">Le total fait ${fmtNombre(somme, 1)} % au lieu de 100 % : pour la simulation, chaque part est recalculée proportionnellement (divisée par ${fmtNombre(somme / 100, 2)}).</div>`);
+  } else {
+    $('#total-lignes').innerHTML = `Total : ${fmtEuro(somme, 0)}`;
+  }
+  const ln = lignesNormalisees();
+  const PEA = ln.lignes.filter(l => l.enveloppe === 'PEA').reduce((s, l) => s + l.poids, 0) * ln.capital;
+  if (PEA > PARAMETRES_FISCAUX.pea.plafondVersements) alertes.push(`<div class="msg erreur">⚠️ Vous prévoyez ${fmtEuro(PEA, 0)} sur le PEA au départ, au-delà du plafond de ${fmtEuro(PARAMETRES_FISCAUX.pea.plafondVersements, 0)} ${aide('plafondPEA')}. L'excédent est placé sur un compte-titres dans la simulation.</div>`);
+  if (ln.ok && ln.capital <= 0 && !(etat.versementMensuel > 0)) alertes.push('<div class="msg attention">Indiquez un capital de départ ou un versement mensuel pour lancer la simulation.</div>');
+  $('#alertes-lignes').innerHTML = alertes.join('');
+  // Le capital suit la somme des lignes en mode « montant »
+  const champCapital = $('input[data-champ="capital"]');
+  champCapital.disabled = etat.modeSaisie === 'montant';
+  if (etat.modeSaisie === 'montant') champCapital.value = Math.round(somme * 100) / 100;
+}
+
+function installerLignes() {
+  const cont = $('#lignes');
+  cont.addEventListener('input', e => {
+    const champ = e.target.dataset.l; if (!champ) return;
+    const l = etat.lignes.find(x => x.id === Number(e.target.closest('.ligne').dataset.id));
+    if (champ === 'valeur') { l.valeur = Math.max(0, parseFloat(e.target.value) || 0); majTotalLignes(); planifierCalcul(); }
+  });
+  cont.addEventListener('change', e => {
+    const champ = e.target.dataset.l; if (!champ || champ === 'valeur') return;
+    const ligneEl = e.target.closest('.ligne');
+    const l = etat.lignes.find(x => x.id === Number(ligneEl.dataset.id));
+    l[champ] = e.target.value;
+    ligneEl.querySelector('.msg-zone').innerHTML = messageCompatibilite(l);
+    majTotalLignes(); planifierCalcul();
+  });
+  cont.addEventListener('click', e => {
+    if (!e.target.closest('[data-suppr]')) return;
+    const id = Number(e.target.closest('.ligne').dataset.id);
+    etat.lignes = etat.lignes.filter(x => x.id !== id);
+    rendreLignes(); planifierCalcul();
+  });
+  $('#ajouter-ligne').addEventListener('click', () => {
+    const utilises = new Set(etat.lignes.map(l => l.actif));
+    const actif = MARCHE.ids.find(id => !utilises.has(id)) || MARCHE.ids[0];
+    const env = MARCHE.actifs[actif].enveloppes.CTO === 'oui' ? 'CTO' : 'AV';
+    etat.lignes.push({ id: ++compteurLignes, actif, valeur: etat.modeSaisie === 'pourcentage' ? 10 : 1000, enveloppe: env });
+    rendreLignes(); planifierCalcul();
+  });
+}
+
+/* Passage % ↔ € : on convertit les valeurs pour garder la même répartition. */
+function changerModeSaisie(mode) {
+  if (mode === etat.modeSaisie) return;
+  const somme = etat.lignes.reduce((s, l) => s + (l.valeur > 0 ? l.valeur : 0), 0) || 1;
+  if (mode === 'montant') {
+    const cap = etat.capital > 0 ? etat.capital : 10000;
+    etat.lignes.forEach(l => { l.valeur = Math.round(cap * l.valeur / somme); });
+  } else {
+    etat.capital = somme;
+    $('input[data-champ="capital"]').value = Math.round(somme);
+    etat.lignes.forEach(l => { l.valeur = Math.round(1000 * l.valeur / somme) / 10; });
+  }
+  etat.modeSaisie = mode;
+  rendreLignes();
+}
+
+/* ============================ Champs de paramètres ============================ */
+function lireChemin(chemin) { return chemin.split('.').reduce((o, k) => o[k], etat); }
+function ecrireChemin(chemin, v) { const k = chemin.split('.'); const dernier = k.pop(); k.reduce((o, x) => o[x], etat)[dernier] = v; }
+
+function synchroniserChamps() {
+  $$('[data-champ]').forEach(el => {
+    const v = lireChemin(el.dataset.champ);
+    if (el.type === 'checkbox') el.checked = !!v;
+    else if (el.type === 'radio') el.checked = el.value === String(v);
+    else if (document.activeElement !== el) el.value = v;
+  });
+  $$('[data-affiche="horizon"]').forEach(el => { el.textContent = fmtAns(etat.horizon); });
+}
+
+function installerChamps() {
+  const annees = anneesCommunes(MARCHE.ids);
+  const optAnnees = annees.map(a => `<option value="${a}">${a}</option>`).join('');
+  $('#sel-debut').innerHTML = optAnnees;
+  $('#sel-fin').innerHTML = optAnnees;
+  $('#sel-reference').innerHTML = optionsActifs(etat.historique.reference);
+
+  function surChangement(e) {
+    const el = e.target.closest('[data-champ]');
+    if (!el || el.closest('#lignes')) return;
+    const chemin = el.dataset.champ;
+    let v;
+    if (el.type === 'checkbox') v = el.checked;
+    else if (el.type === 'radio') { if (!el.checked) return; v = el.value; }
+    else if (el.type === 'number' || el.type === 'range') {
+      v = parseFloat(el.value); if (!isFinite(v)) v = 0;
+      if (el.min !== '' && v < +el.min) v = +el.min;
+      if (el.max !== '' && v > +el.max) v = +el.max;
+    }
+    else v = /^(historique\.(debut|fin)|projection\.)/.test(chemin) ? Number(el.value) : el.value;
+    if (chemin === 'modeSaisie') changerModeSaisie(v);
+    else ecrireChemin(chemin, v);
+    synchroniserChamps();
+    if (chemin === 'modeSaisie' || chemin === 'capital' || chemin === 'versementMensuel') majTotalLignes();
+    planifierCalcul(el.dataset.portee || 'tout');
+  }
+  // Saisie au clavier et curseurs : à chaque frappe ; listes, cases et boutons radio : à la validation
+  document.addEventListener('input', e => { if (e.target.matches('input[type=number], input[type=range]')) surChangement(e); });
+  document.addEventListener('change', e => { if (e.target.matches('select, input[type=radio], input[type=checkbox]')) surChangement(e); });
+}
+
+/* ======================= Planification des calculs ======================= */
+let minuteur = null, porteeEnAttente = null;
+const RANG = { fiscal: 0, historique: 1, tout: 2 };
+function planifierCalcul(portee = 'tout') {
+  if (!porteeEnAttente || RANG[portee] > RANG[porteeEnAttente]) porteeEnAttente = portee;
+  clearTimeout(minuteur);
+  minuteur = setTimeout(() => { const p = porteeEnAttente; porteeEnAttente = null; recalculer(p); }, 250);
+}
+
+function recalculer(portee) {
+  const ln = lignesNormalisees();
+  if (!ln.ok || (ln.capital <= 0 && !(etat.versementMensuel > 0))) { afficherVide(); return; }
+  if (portee === 'fiscal') { rendreFiscalite(); rendreResume(); return; }
+  rendreHistorique(ln);
+  rendreRisques(ln);
+  rendreCrises(ln);
+  if (portee === 'tout') { rendreDonuts(ln); lancerMonteCarlo(ln); }
+  rendreResume();
+}
+
+function afficherVide() {
+  ['#r-mediane', '#r-verse', '#r-gain', '#r-dd'].forEach(s => { $(s).textContent = '—'; });
+  ['#r-mediane-sous', '#r-verse-sous', '#r-gain-sous', '#r-dd-sous'].forEach(s => { $(s).innerHTML = '&nbsp;'; });
+  $('#mc-chargement').classList.remove('actif');
+}
+
+/* ================================ Donuts ================================ */
+function rendreDonuts(ln) {
+  const cap = ln.capital;
+  const agreg = cle => {
+    const m = {};
+    ln.lignes.forEach(l => {
+      const a = MARCHE.actifs[l.actif];
+      if (cle === 'zone') for (const [z, pc] of Object.entries(a.zones || { 'Mondial (sans zone)': 100 })) m[z] = (m[z] || 0) + l.poids * pc / 100;
+      else { const k = cle === 'classe' ? a.classe : l.enveloppe; m[k] = (m[k] || 0) + l.poids; }
+    });
+    return m;
+  };
+  const donut = (id, m, ordre, libelles) => {
+    const cles = ordre.filter(k => m[k] > 1e-9);
+    dessiner(id, {
+      type: 'doughnut',
+      data: { labels: cles.map(k => libelles ? libelles[k] : k), datasets: [{ data: cles.map(k => m[k]), backgroundColor: cles.map(k => SERIES[ordre.indexOf(k)]), borderColor: '#fff', borderWidth: 2, hoverOffset: 6 }] },
+      options: { cutout: '66%', plugins: { legend: { position: 'bottom' }, tooltip: { callbacks: { label: c => ` ${c.label} : ${fmtPct(c.parsed, 1)}${cap > 0 ? ' — ' + fmtEuro(c.parsed * cap, 0) : ''}` } } } },
+    });
+  };
+  donut('g-classes', agreg('classe'), CLASSES);
+  donut('g-enveloppes', agreg('enveloppe'), Object.keys(ENVELOPPES), ENVELOPPES);
+  const zones = agreg('zone');
+  donut('g-zones', zones, ZONES.concat(Object.keys(zones).filter(z => !ZONES.includes(z))));
+}
+
+/* ============================= Historique ============================= */
+function rendreHistorique(ln) {
+  const ref = etat.historique.reference;
+  const dispo = anneesCommunes(idsDe(ln).concat([ref]));
+  let debut = etat.historique.debut, fin = etat.historique.fin;
+  if (debut > fin) [debut, fin] = [fin, debut];
+  const annees = dispo.filter(a => a >= debut && a <= fin);
+  if (!annees.length) { $('#bt-kpis').innerHTML = '<p class="note">Aucune donnée commune sur cette période.</p>'; return; }
+  const seq = annees.map((_, i) => i);
+
+  const base = construireConfig(ln, annees);
+  const tAvec = simulerTrajectoire(seq, Object.assign({}, base.cfg, { reequilibrage: true }), base.facteurs, { twr: true, mensuel: true });
+  const tSans = simulerTrajectoire(seq, Object.assign({}, base.cfg, { reequilibrage: false }), base.facteurs, { twr: true, mensuel: true });
+  const t = etat.reequilibrage ? tAvec : tSans;
+  const cRef = construireConfig(lnReference(ln, ref), annees);
+  const tRef = simulerTrajectoire(seq, cRef.cfg, cRef.facteurs, { twr: true });
+
+  const labels = [`début ${annees[0]}`].concat(annees.map(a => `fin ${a}`));
+  const nomRef = MARCHE.actifs[ref].nomCourt;
+  dessiner('g-backtest', {
+    type: 'line',
+    data: { labels, datasets: [
+      { label: 'Votre portefeuille', data: Array.from(t.valeurs), borderColor: C.accent, backgroundColor: 'rgba(42,120,214,.08)', fill: 'origin', borderWidth: 2, pointRadius: 0, pointHoverRadius: 5, tension: 0.25 },
+      { label: `Référence : ${nomRef}`, data: Array.from(tRef.valeurs), borderColor: C.ref, borderWidth: 2, pointRadius: 0, pointHoverRadius: 5, tension: 0.25 },
+      { label: 'Total versé', data: Array.from(t.verses), borderColor: C.verse, borderDash: [5, 4], borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, stepped: false },
+    ] },
+    options: { interaction: { mode: 'index', intersect: false }, scales: { x: axeX, y: axeEuros() },
+      plugins: { legend: { position: 'bottom' }, tooltip: { callbacks: { label: c => ` ${c.dataset.label} : ${fmtEuro(c.parsed.y, 0)}` } } } },
+  });
+
+  const H = annees.length, vf = t.valeurs[H], vv = t.verses[H], gain = vf - vv;
+  const perf = rendementAnnualise(Array.from(t.twr)), perfRef = rendementAnnualise(Array.from(tRef.twr));
+  $('#bt-periode').textContent = `Du 1er janvier ${annees[0]} au 31 décembre ${annees[H - 1]} (${fmtAns(H)}), ${etat.reequilibrage ? 'avec' : 'sans'} rééquilibrage annuel, frais inclus.`;
+  const kpi = (lib, val, sous, cls = '', cle = '') => `<div class="kpi"><span class="libelle">${lib} ${cle ? aide(cle) : ''}</span><strong class="${cls}">${val}</strong><small>${sous}</small></div>`;
+  $('#bt-kpis').innerHTML = [
+    kpi('Valeur finale', fmtEuro(vf), `au 31 décembre ${annees[H - 1]}`),
+    kpi('Total versé', fmtEuro(vv), 'capital + versements', '', 'totalVerse'),
+    kpi('Gain', fmtEuro(gain), vv > 0 ? `${fmtPct(gain / vv, 1, true)} par rapport au versé` : '', classeSigne(gain), 'gain'),
+    kpi('Performance annualisée', fmtPct(perf, 2, true), 'par an, indépendamment des versements', classeSigne(perf), 'twr'),
+    kpi(`Référence : ${echap(nomRef)}`, fmtEuro(tRef.valeurs[H]), `${fmtPct(perfRef, 2, true)} par an`),
+    kpi('Écart avec la référence', fmtEuro(vf - tRef.valeurs[H]), vf >= tRef.valeurs[H] ? 'votre portefeuille fait mieux' : 'la référence fait mieux', classeSigne(vf - tRef.valeurs[H])),
+  ].join('');
+
+  const dA = tAvec.valeurs[H], dS = tSans.valeurs[H], diff = dA - dS;
+  const ddA = analyserDrawdown(Array.from(tAvec.indiceMens)), ddS = analyserDrawdown(Array.from(tSans.indiceMens));
+  $('#bt-reeq').innerHTML = [
+    kpi('Avec rééquilibrage', fmtEuro(dA), `perte maximale ${fmtPct(ddA.max, 1)}`),
+    kpi('Sans rééquilibrage', fmtEuro(dS), `perte maximale ${fmtPct(ddS.max, 1)}`),
+    kpi('Différence', fmtEuro(diff), dS > 0 ? fmtPct(diff / dS, 2, true) : '', classeSigne(diff)),
+  ].join('');
+  const plusieurs = ln.lignes.length > 1;
+  $('#bt-reeq-phrase').textContent = !plusieurs
+    ? "Avec une seule ligne, le rééquilibrage n'a aucun effet."
+    : !(etat.versementMensuel > 0) && new Set(ln.lignes.map(l => l.enveloppe)).size === ln.lignes.length
+      ? "Sans versements mensuels et avec une seule ligne par enveloppe, le rééquilibrage ne peut pas agir : il se fait par arbitrage dans une enveloppe, ou en orientant les nouveaux versements."
+      : Math.abs(diff) < 1
+      ? "Sur cette période, le rééquilibrage n'a pratiquement rien changé."
+      : `Sur cette période, le rééquilibrage annuel aurait ${diff > 0 ? 'rapporté' : 'coûté'} ${fmtEuro(Math.abs(diff), 0)}. Son but premier n'est pas de gagner plus mais de garder le niveau de risque choisi : sans lui, les actifs qui montent prennent de plus en plus de place.`;
+}
+
+/* ========================= Risques (historique complet) ========================= */
+function statistiquesRisque(ln, annees) {
+  const c = construireConfig(ln, annees);
+  const seq = annees.map((_, i) => i);
+  const t = simulerTrajectoire(seq, c.cfg, c.facteurs, { twr: true, mensuel: true });
+  const r = Array.from(t.twr);
+  const rf = annees.map(a => MARCHE.rf[a] || 0);
+  const dd = analyserDrawdown(Array.from(t.indiceMens));
+  let iPire = 0, iMeilleure = 0;
+  r.forEach((x, i) => { if (x < r[iPire]) iPire = i; if (x > r[iMeilleure]) iMeilleure = i; });
+  return {
+    r, annees, rendement: rendementAnnualise(r), volatilite: ecartType(r), sharpe: ratioSharpe(r, rf), rfMoyen: moyenne(rf),
+    pire: { valeur: r[iPire], annee: annees[iPire] }, meilleure: { valeur: r[iMeilleure], annee: annees[iMeilleure] },
+    dd, indiceMens: Array.from(t.indiceMens), multiple: r.reduce((p, x) => p * (1 + x), 1),
+  };
+}
+
+function rendreRisques(ln) {
+  const ref = etat.historique.reference;
+  const annees = anneesCommunes(idsDe(ln).concat([ref]));
+  if (!annees.length) return;
+  const a0 = annees[0], aN = annees[annees.length - 1];
+  const s = statistiquesRisque(ln, annees);
+  const sr = statistiquesRisque(lnReference(ln, ref), annees);
+  const nomRef = MARCHE.actifs[ref].nomCourt;
+  resultatRisque = s;
+  $('#rq-sous-titre').textContent = `Calculés sur toute la période disponible (${a0}-${aN}, ${fmtAns(annees.length)}), données annuelles en euros, frais inclus, ${etat.reequilibrage ? 'avec' : 'sans'} rééquilibrage. Comparaison : ${nomRef}.`;
+
+  const d = s.dd, dRef = sr.dd;
+  const qualVol = v => v < 0.03 ? 'très faible' : v < 0.08 ? 'modérée' : v < 0.14 ? 'assez élevée' : 'élevée';
+  const qualSharpe = x => x < 0.2 ? 'faible' : x < 0.5 ? 'moyen' : x < 0.8 ? 'correct' : 'bon';
+  const duree = dd => dd.iRetour >= 0 ? fmtDuree(dd.iRetour - dd.iPic) : null;
+
+  const phraseDD = d.max >= -0.0001
+    ? "Votre portefeuille n'aurait jamais baissé d'une fin d'année à l'autre sur la période."
+    : `Votre portefeuille aurait perdu jusqu'à ${fmtPct(-d.max, 0)} (entre ${libelleMois(a0, d.iPic)} et ${libelleMois(a0, d.iCreux)})` +
+      (d.iRetour >= 0 ? ` et mis environ ${duree(d)} à revenir à son niveau précédent (${vers(a0, d.iRetour)}).` : ` et n'avait pas encore retrouvé son niveau précédent fin ${aN}.`);
+
+  const carte = (titre, cle, valeur, cls, valRef, phrase) => `
+    <div class="indicateur">
+      <span class="libelle">${titre} ${aide(cle)}</span>
+      <div class="valeurs"><strong class="${cls}">${valeur}</strong><span class="ref">${echap(nomRef)} : ${valRef}</span></div>
+      <p class="phrase">${phrase}</p>
+    </div>`;
+  $('#rq-indicateurs').innerHTML = [
+    carte('Rendement annualisé', 'rendement', fmtPct(s.rendement, 1, true), classeSigne(s.rendement), fmtPct(sr.rendement, 1, true),
+      `En moyenne ${fmtPct(s.rendement, 1)} par an : 10 000 € placés début ${a0}, sans versement, seraient devenus ${fmtEuro(10000 * s.multiple, 0)} fin ${aN}.`),
+    carte('Volatilité', 'volatilite', fmtPct(s.volatilite, 1), '', fmtPct(sr.volatilite, 1),
+      `Volatilité ${qualVol(s.volatilite)} : environ 2 années sur 3, la performance s'est située entre ${fmtPct(s.rendement - s.volatilite, 0)} et ${fmtPct(s.rendement + s.volatilite, 0)}. Repères : actions mondiales ≈ 15 %, fonds euros ≈ 2 %.`),
+    carte('Pire année', 'pireAnnee', fmtPct(s.pire.valeur, 1, true), classeSigne(s.pire.valeur), `${fmtPct(sr.pire.valeur, 1, true)} (${sr.pire.annee})`,
+      `La pire année aurait été ${s.pire.annee} : 10 000 € au 1er janvier seraient tombés à ${fmtEuro(10000 * (1 + s.pire.valeur), 0)} au 31 décembre. La meilleure : ${s.meilleure.annee} (${fmtPct(s.meilleure.valeur, 1, true)}).`),
+    carte('Perte maximale', 'drawdown', fmtPct(d.max, 1), classeSigne(d.max), `${fmtPct(dRef.max, 1)}${duree(dRef) ? ', récupérée en ' + duree(dRef) : ''}`,
+      phraseDD + ` <span class="note">Temps de récupération ${aide('recuperation')} estimé à partir de données annuelles.</span>`),
+    carte('Ratio de Sharpe', 'sharpe', fmtNombre(s.sharpe, 2), '', fmtNombre(sr.sharpe, 2),
+      `Niveau ${qualSharpe(s.sharpe)} : chaque point de volatilité a rapporté ${fmtNombre(s.sharpe, 2)} point de rendement au-dessus d'un placement sans risque (taux monétaire moyen de ${fmtPct(s.rfMoyen, 1)} par an sur la période).`),
+  ].map(h => `<div class="kpi" style="padding:18px">${h}</div>`).join('');
+
+  dessiner('g-annees', {
+    type: 'bar',
+    data: { labels: s.annees.map(String), datasets: [{ label: 'Votre portefeuille', data: s.r.map(x => x * 100), backgroundColor: s.r.map(x => x >= 0 ? C.gain : C.perte), borderRadius: 4, maxBarThickness: 18 }] },
+    options: { plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => ` ${fmtPct(c.parsed.y / 100, 1, true)}` } } }, scales: { x: axeX, y: axePct() } },
+  });
+  const labelsM = s.indiceMens.map((_, i) => libelleMois(a0, i));
+  dessiner('g-drawdown', {
+    type: 'line',
+    data: { labels: labelsM, datasets: [
+      { label: 'Votre portefeuille', data: serieDrawdown(s.indiceMens).map(x => x * 100), borderColor: C.perte, backgroundColor: 'rgba(208,59,59,.12)', fill: 'origin', borderWidth: 2, pointRadius: 0, pointHoverRadius: 4, tension: 0.1 },
+      { label: nomRef, data: serieDrawdown(sr.indiceMens).map(x => x * 100), borderColor: '#9aa1ad', borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, pointHoverRadius: 4, tension: 0.1 },
+    ] },
+    options: { interaction: { mode: 'index', intersect: false }, plugins: { legend: { position: 'bottom' }, tooltip: { callbacks: { label: c => ` ${c.dataset.label} : ${fmtPct(c.parsed.y / 100, 1)}` } } },
+      scales: { x: Object.assign({}, axeX, { ticks: { maxRotation: 0, autoSkip: false, callback: (v, i) => (i % 60 === 0 ? labelsM[i].replace('fin ', '').replace('début ', '') : null) } }), y: Object.assign(axePct(), { max: 0 }) } },
+  });
+}
+
+/* ============================== Test de crise ============================== */
+/* Rejoue le portefeuille (sans versements) à partir de la 1re année de la crise
+   jusqu'à la dernière année disponible. Renvoie la perte au creux pendant la crise
+   et le temps de retour au niveau d'avant-crise. */
+function testerCrise(ln, crise, annees, capital) {
+  const i0 = annees.indexOf(crise.annees[0]);
+  if (i0 < 0 || crise.annees.some(a => !annees.includes(a))) return null;
+  const sous = annees.slice(i0);
+  const c = construireConfig(Object.assign({}, ln, { capital }), sous, { versementMensuel: 0, hausseVersement: 0 });
+  const t = simulerTrajectoire(sous.map((_, i) => i), c.cfg, c.facteurs, { mensuel: true });
+  const m = t.mens, fenetre = crise.annees.length * 12;
+  let iCreux = 0;
+  for (let i = 1; i <= fenetre; i++) if (m[i] < m[iCreux]) iCreux = i;
+  const perte = m[iCreux] / m[0] - 1;
+  let iRetour = perte < 0 ? -1 : 0;
+  if (perte < 0) for (let i = iCreux + 1; i < m.length; i++) if (m[i] >= m[0]) { iRetour = i; break; }
+  return { perte, perteEuros: m[iCreux] - m[0], iCreux, iRetour, finCrise: m[fenetre] / m[0] - 1, debut: sous[0], dernier: sous[sous.length - 1] };
+}
+
+function rendreCrises(ln) {
+  const ref = etat.historique.reference;
+  const annees = anneesCommunes(idsDe(ln).concat([ref]));
+  const capital = ln.capital > 0 ? ln.capital : 10000;
+  const nomRef = MARCHE.actifs[ref].nomCourt;
+  $('#cr-sous-titre').textContent = `${fmtEuro(capital, 0)} ${ln.capital > 0 ? '(votre capital de départ)' : '(montant d’illustration)'} placés selon votre portefeuille actuel au début de chaque crise, sans nouveau versement, ${etat.reequilibrage ? 'avec' : 'sans'} rééquilibrage. Données annuelles : les chutes à l'intérieur d'une année sont lissées.`;
+  const res = DONNEES_MARCHE.crises.map(cr => ({ cr, p: testerCrise(ln, cr, annees, capital), r: testerCrise(lnReference(ln, ref), cr, annees, capital) })).filter(x => x.p);
+
+  dessiner('g-crises', {
+    type: 'bar',
+    data: { labels: res.map(x => `${x.cr.nom} (${x.cr.periode})`), datasets: [
+      { label: 'Votre portefeuille', data: res.map(x => Math.min(0, x.p.perte) * 100), backgroundColor: C.accent, borderRadius: 4, maxBarThickness: 36 },
+      { label: nomRef, data: res.map(x => Math.min(0, x.r.perte) * 100), backgroundColor: C.ref, borderRadius: 4, maxBarThickness: 36 },
+    ] },
+    options: { plugins: { legend: { position: 'bottom' }, tooltip: { callbacks: { label: c => ` ${c.dataset.label} : ${fmtPct(c.parsed.y / 100, 1)}` } } },
+      scales: { x: Object.assign({}, axeX, { ticks: { maxRotation: 0, autoSkip: false, callback: function (v) { const l = this.getLabelForValue(v); return l.length > 18 ? l.split(' (')[0] : l; } } }), y: Object.assign(axePct(), { max: 0 }) } },
+  });
+
+  const recup = (x) => {
+    if (x.perte >= 0) return 'Aucune baisse visible en données annuelles.';
+    if (x.iRetour < 0) return `Pas encore revenu à son niveau d'avant-crise fin ${x.dernier}.`;
+    return `Retour au niveau d'avant-crise en ${fmtDuree(x.iRetour)} (${vers(x.debut, x.iRetour)}).`;
+  };
+  $('#cr-cartes').innerHTML = res.map(({ cr, p, r }) => `
+    <div class="kpi crise" style="padding:18px">
+      <h3>${echap(cr.nom)}</h3>
+      <p class="periode">${cr.periode} — départ le 1er janvier ${cr.annees[0]}</p>
+      <div class="lignes-chiffres">
+        <div><span>Perte au plus bas</span><strong class="${classeSigne(p.perte)}">${p.perte < 0 ? fmtPct(p.perte, 1) : 'aucune'}</strong></div>
+        <div><span>Soit en euros</span><strong class="${classeSigne(p.perte)}">${p.perte < 0 ? fmtEuro(p.perteEuros, 0) : '0 €'}</strong></div>
+        <div><span>Résultat fin ${cr.annees[cr.annees.length - 1]}</span><strong class="${classeSigne(p.finCrise)}">${fmtPct(p.finCrise, 1, true)}</strong></div>
+        <div><span>${echap(nomRef)}</span><span>${r.perte < 0 ? fmtPct(r.perte, 1) : 'aucune perte'}</span></div>
+      </div>
+      <p class="phrase" style="margin-top:10px;font-size:14px"><strong>Récupération :</strong> ${recup(p)}</p>
+      <p class="repere">📌 ${echap(cr.repere)}</p>
+    </div>`).join('');
+}
+
+/* ============================== Monte Carlo ============================== */
+let worker = null, idRequete = 0, workerEnPanne = false;
+function creerWorker() {
+  if (workerEnPanne || typeof Worker === 'undefined') return null;
+  try {
+    const src = document.getElementById('moteur-calcul').textContent +
+      '\nself.onmessage = function (e) { try { self.postMessage({ id: e.data.id, res: executerMonteCarlo(e.data) }); }' +
+      ' catch (err) { self.postMessage({ id: e.data.id, erreur: String(err) }); } };';
+    const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    w.onmessage = e => { if (e.data.erreur) console.error(e.data.erreur); else recevoirMC(e.data.id, e.data.res); };
+    w.onerror = err => { console.warn('Web Worker indisponible : calcul dans la page.', err); workerEnPanne = true; worker = null; if (dernierParams) calculerSansWorker(dernierParams); };
+    return w;
+  } catch (e) { workerEnPanne = true; return null; }
+}
+let dernierParams = null;
+function calculerSansWorker(params) {
+  setTimeout(() => { recevoirMC(params.id, executerMonteCarlo(params)); }, 30);
+}
+
+function lancerMonteCarlo(ln) {
+  const annees = anneesCommunes(idsDe(ln));
+  const c = construireConfig(ln, annees);
+  const params = {
+    id: ++idRequete, matrice: c.matrice, positions: c.cfg.positions, capital: c.cfg.capital,
+    versementMensuel: c.cfg.versementMensuel, hausseVersement: c.cfg.hausseVersement, reequilibrage: c.cfg.reequilibrage,
+    plafondPEA: c.cfg.plafondPEA, horizon: etat.horizon, nSim: etat.projection.nSim, bloc: etat.projection.bloc,
+    graine: etat.projection.graine, anneesSource: [annees[0], annees[annees.length - 1]],
+  };
+  dernierParams = params;
+  $('#mc-chargement').classList.add('actif');
+  $('#r-mediane').innerHTML = '<span class="mini-spinner"></span>';
+  if (!worker) worker = creerWorker();
+  if (worker) worker.postMessage(params); else calculerSansWorker(params);
+}
+
+function recevoirMC(id, res) {
+  if (id !== idRequete) return;          // un calcul plus récent est en cours
+  res.anneesSource = dernierParams.anneesSource;
+  resultatMC = res;
+  $('#mc-chargement').classList.remove('actif');
+  rendreProjection();
+  rendreFiscalite();
+  rendreResume();
+}
+
+function fiscaliteScenario(sc) {
+  const H = resultatMC.horizon, f = etat.fiscalite;
+  return calculerFiscalite(sc.enveloppes, { dureePEA: H + (f.anciennetePEA || 0), dureeAV: H + (f.ancienneteAV || 0), situation: f.situation }, PARAMETRES_FISCAUX);
+}
+const SCENARIOS = [
+  { cle: 'pessimiste', nom: 'Pessimiste', idx: 0, cas: '9 cas sur 10', txt: 'Seulement 1 scénario sur 10 fait moins bien.' },
+  { cle: 'median', nom: 'Médian', idx: 2, cas: '1 cas sur 2', txt: 'Autant de scénarios au-dessus qu’en dessous.' },
+  { cle: 'optimiste', nom: 'Optimiste', idx: 4, cas: '1 cas sur 10', txt: 'Seulement 1 scénario sur 10 fait mieux.' },
+];
+
+function rendreProjection() {
+  const R = resultatMC, H = R.horizon, an0 = new Date().getFullYear();
+  const labels = Array.from({ length: H + 1 }, (_, k) => k === 0 ? "Aujourd'hui" : String(an0 + k));
+  const b = R.bandes;
+  const serie = (label, data, style) => Object.assign({ label, data, pointRadius: 0, pointHoverRadius: 4, borderWidth: 0, tension: 0.25, fill: false }, style);
+  dessiner('g-eventail', {
+    type: 'line',
+    data: { labels, datasets: [
+      serie('Percentile 10 (pessimiste)', b[0], { borderColor: 'rgba(42,120,214,.35)', borderWidth: 1 }),
+      serie('Percentile 90 (optimiste)', b[4], { borderColor: 'rgba(42,120,214,.35)', borderWidth: 1, backgroundColor: 'rgba(42,120,214,.12)', fill: '-1' }),
+      serie('Percentile 25', b[1], { borderColor: 'rgba(42,120,214,.5)', borderWidth: 1 }),
+      serie('Percentile 75', b[3], { borderColor: 'rgba(42,120,214,.5)', borderWidth: 1, backgroundColor: 'rgba(42,120,214,.24)', fill: '-1' }),
+      serie('Médiane', b[2], { borderColor: C.accent, borderWidth: 2.5 }),
+      serie('Total versé', R.verses, { borderColor: C.verse, borderWidth: 2, borderDash: [5, 4] }),
+    ] },
+    options: {
+      interaction: { mode: 'index', intersect: false }, scales: { x: axeX, y: axeEuros() },
+      plugins: {
+        legend: { position: 'bottom', labels: { filter: it => !/Percentile (25|75)/.test(it.text) } },
+        tooltip: { itemSort: (a, b2) => b2.parsed.y - a.parsed.y, callbacks: {
+          title: it => it[0].dataIndex === 0 ? "Aujourd'hui" : `${it[0].label} (dans ${fmtAns(it[0].dataIndex)})`,
+          label: c => ` ${c.dataset.label} : ${fmtEuro(c.parsed.y, 0)}` } },
+      },
+    },
+  });
+
+  const alertes = [];
+  const ap = R.scenarios[2].anneePlafond;
+  if (R.probaPlafond > 0) alertes.push(`<div class="msg attention">Le plafond de versements du PEA (${fmtEuro(PARAMETRES_FISCAUX.pea.plafondVersements, 0)}) ${aide('plafondPEA')} est atteint dans ${fmtNombre(R.probaPlafond * 100, 0)} % des scénarios${ap >= 0 ? ` (scénario médian : ${ap === 0 ? 'dès la première année' : `au bout d'environ ${fmtAns(ap + 1)}, vers ${an0 + ap + 1}`})` : ''}. Au-delà, les versements prévus sur le PEA sont placés sur un compte-titres (même actif, fiscalité du CTO).</div>`);
+  $('#mc-alertes').innerHTML = alertes.join('');
+
+  $('#mc-scenarios').innerHTML = SCENARIOS.map(s => {
+    const sc = R.scenarios[s.idx], gain = sc.total - sc.verse, f = fiscaliteScenario(sc);
+    return `<div class="carte scenario ${s.cle}">
+      <span class="libelle">${s.nom} ${aide(s.cle === 'median' ? 'mediane' : 'percentile')}</span>
+      <div class="montant">${fmtEuro(sc.total, 0)}</div>
+      <div class="lignes-chiffres">
+        <div><span>Total versé</span><span>${fmtEuro(sc.verse, 0)}</span></div>
+        <div><span>Gain</span><strong class="${classeSigne(gain)}">${fmtEuro(gain, 0)}</strong></div>
+        <div><span>Impôts si retrait total</span><span>${fmtEuro(-f.total.impot, 0)}</span></div>
+        <div class="sep"><span>Net d'impôts</span><span>${fmtEuro(f.total.net, 0)}</span></div>
+      </div>
+      <p class="note">${s.txt}</p>
+    </div>`;
+  }).join('');
+
+  const P = i => R.scenarios[i].total, infl = Math.pow(1 + HYPOTHESES.inflationAnnuelle / 100, H);
+  $('#mc-sous-titre').textContent = `${fmtNombre(R.nSim, 0)} scénarios sur ${fmtAns(H)}, construits à partir des années ${R.anneesSource[0]}-${R.anneesSource[1]} (blocs de ${fmtAns(etat.projection.bloc)}).`;
+  $('#mc-phrases').innerHTML = [
+    `Dans <strong>9 cas sur 10</strong>, votre portefeuille dépasse <strong>${fmtEuro(P(0), 0)}</strong> dans ${fmtAns(H)}.`,
+    `Dans <strong>1 cas sur 2</strong>, il dépasse <strong>${fmtEuro(P(2), 0)}</strong>.`,
+    `Dans <strong>1 cas sur 10</strong>, il dépasse <strong>${fmtEuro(P(4), 0)}</strong>.`,
+    `Vous aurez versé <strong>${fmtEuro(R.verses[H], 0)}</strong> au total. ` + (R.probaSousVerse === 0
+      ? 'Dans <strong>aucun scénario</strong> vous ne récupéreriez moins que cette somme (ce qui ne garantit rien : l’avenir peut être pire que le passé).'
+      : `Dans <strong>${R.probaSousVerse < 0.01 ? 'moins de 1 %' : fmtNombre(R.probaSousVerse * 100, 0) + ' %'} des scénarios</strong>, vous récupéreriez moins que cette somme${R.probaSousVerse > 0.2 ? ' : un horizon plus long ou un portefeuille plus prudent réduirait ce risque' : ''}.`),
+    `Pouvoir d'achat ${aide('inflation')} : avec ${fmtNombre(HYPOTHESES.inflationAnnuelle, 1)} % d'inflation par an, ${fmtEuro(P(2), 0)} dans ${fmtAns(H)} équivalent à environ <strong>${fmtEuro(P(2) / infl, 0)} d'aujourd'hui</strong>.`,
+  ].map(x => `<li>${x}</li>`).join('');
+}
+
+/* ================================ Fiscalité ================================ */
+function rendreFiscalite() {
+  const P = PARAMETRES_FISCAUX, f = etat.fiscalite;
+  if (!resultatMC) return;
+  const H = resultatMC.horizon, dPEA = H + (f.anciennetePEA || 0), dAV = H + (f.ancienneteAV || 0);
+  const res = SCENARIOS.map(s => ({ s, sc: resultatMC.scenarios[s.idx], fi: fiscaliteScenario(resultatMC.scenarios[s.idx]) }));
+
+  const alertes = [];
+  const vPEA = resultatMC.scenarios[2].enveloppes.PEA.verse;
+  if (vPEA > 0) alertes.push(`<div class="msg info">Versements cumulés sur le PEA à l'horizon (scénario médian) : ${fmtEuro(vPEA, 0)} sur un plafond de ${fmtEuro(P.pea.plafondVersements, 0)} ${aide('plafondPEA')}.${resultatMC.scenarios[2].anneePlafond >= 0 ? ' Le plafond est atteint : le surplus est simulé sur un compte-titres.' : ''}</div>`);
+  $('#fi-alertes').innerHTML = alertes.join('');
+
+  const ligne = (lib, x, cls = '') => `<tr class="${cls}"><td>${lib}</td><td class="nombre">${fmtEuro(x.valeur, 0)}</td><td class="nombre">${fmtEuro(-x.impot, 0)}</td><td class="nombre">${fmtEuro(x.net, 0)}</td></tr>`;
+  $('#fi-scenarios').innerHTML = res.map(({ s, sc, fi }) => `
+    <div class="carte scenario ${s.cle}">
+      <span class="libelle">${s.nom}</span>
+      <div class="montant">${fmtEuro(fi.total.net, 0)} <span style="font-size:14px;font-weight:500;color:var(--muet)">net</span></div>
+      <div class="table-defil"><table class="tfisc">
+        <thead><tr><th></th><th class="nombre">Brut</th><th class="nombre">Impôts</th><th class="nombre">Net</th></tr></thead>
+        <tbody>
+          ${['PEA', 'CTO', 'AV'].filter(e => sc.enveloppes[e].valeur > 0.5).map(e => ligne(e === 'AV' ? 'Assurance-vie' : e, fi[e])).join('')}
+          ${ligne('Total', fi.total, 'total')}
+        </tbody></table></div>
+      <div class="lignes-chiffres" style="margin-top:12px">
+        <div><span>Dont impôt sur le revenu</span><span>${fmtEuro(fi.total.ir, 0)}</span></div>
+        <div><span>Dont prélèvements sociaux ${aide('ps')}</span><span>${fmtEuro(fi.total.ps, 0)}</span></div>
+        <div><span>Taux moyen sur le gain</span><span>${fi.total.gain > 0 ? fmtPct(fi.total.impot / fi.total.gain, 1) : '—'}</span></div>
+      </div>
+    </div>`).join('');
+
+  dessiner('g-fiscalite', {
+    type: 'bar',
+    data: { labels: res.map(x => x.s.nom), datasets: [
+      { label: 'Total versé', data: res.map(x => x.fi.total.verse), backgroundColor: '#b9bec8', borderColor: '#fff', borderWidth: { top: 2 }, borderSkipped: false, maxBarThickness: 70 },
+      { label: 'Gain net (après impôts)', data: res.map(x => Math.max(0, x.fi.total.net - x.fi.total.verse)), backgroundColor: C.gain, borderColor: '#fff', borderWidth: { top: 2 }, borderSkipped: false, maxBarThickness: 70 },
+      { label: 'Impôts et prélèvements', data: res.map(x => x.fi.total.impot), backgroundColor: C.perte, borderRadius: { topLeft: 4, topRight: 4 }, borderSkipped: false, maxBarThickness: 70 },
+    ] },
+    options: { interaction: { mode: 'index', intersect: false }, scales: { x: Object.assign({ stacked: true }, axeX), y: Object.assign({ stacked: true }, axeEuros()) },
+      plugins: { legend: { position: 'bottom' }, tooltip: { callbacks: { label: c => ` ${c.dataset.label} : ${fmtEuro(c.parsed.y, 0)}` } } } },
+  });
+
+  const A = P.assuranceVie, psC = fmtPct(P.prelevementsSociaux), psA = fmtPct(P.prelevementsSociauxAssuranceVie), ir = fmtPct(P.pfuImpotRevenu);
+  const actif = (ok) => ok ? '<strong class="positif">✓ appliqué à votre horizon</strong>' : '<span class="note">non applicable à votre horizon</span>';
+  $('#fi-regles').innerHTML = `
+    <div class="regime"><h3>PEA ${aide('plafondPEA')}</h3>
+      <p>Détention à l'horizon : <strong>${fmtAns(dPEA)}</strong>.</p>
+      <ul>
+        <li>Plafond de versements : ${fmtEuro(P.pea.plafondVersements, 0)}.</li>
+        <li>Avant ${P.pea.dureeExoneration} ans : retrait = clôture, gain taxé au PFU (${ir} + ${psC}). ${actif(dPEA < P.pea.dureeExoneration)}</li>
+        <li>Après ${P.pea.dureeExoneration} ans : exonération d'impôt sur le revenu, seuls les prélèvements sociaux (${psC}) sont dus. ${actif(dPEA >= P.pea.dureeExoneration)}</li>
+      </ul></div>
+    <div class="regime"><h3>Compte-titres (CTO) ${aide('pfu')}</h3>
+      <ul>
+        <li>Plus-values et dividendes taxés au prélèvement forfaitaire unique : ${ir} d'impôt + ${psC} de prélèvements sociaux = ${fmtPct(P.pfuImpotRevenu + P.prelevementsSociaux)}.</li>
+        <li>Aucun plafond, tous les actifs sont possibles.</li>
+      </ul></div>
+    <div class="regime"><h3>Assurance-vie ${aide('abattement')}</h3>
+      <p>Détention à l'horizon : <strong>${fmtAns(dAV)}</strong>.</p>
+      <ul>
+        <li>Avant ${A.dureeAvantage} ans : gain taxé au PFU (${ir} + ${psA}). ${actif(dAV < A.dureeAvantage)}</li>
+        <li>Après ${A.dureeAvantage} ans : abattement de ${fmtEuro(A.abattementCelibataire, 0)} (célibataire) ou ${fmtEuro(A.abattementCouple, 0)} (couple) sur le gain, puis ${fmtPct(A.tauxReduitApres8Ans)} d'impôt (${ir} pour la part liée aux versements au-delà de ${fmtEuro(A.seuilVersements, 0)}) + ${psA} de prélèvements sociaux. ${actif(dAV >= A.dureeAvantage)}</li>
+        <li>Frais de gestion des unités de compte simulés : ${fmtNombre(HYPOTHESES.fraisGestionAssuranceVieUC, 1)} %/an ${aide('frais')}.</li>
+      </ul></div>`;
+}
+
+/* =========================== Cartes résumé =========================== */
+function rendreResume() {
+  if (resultatMC) {
+    const R = resultatMC, H = R.horizon, med = R.scenarios[2], gain = med.total - med.verse, f = fiscaliteScenario(med);
+    $('#r-mediane').textContent = fmtEuro(med.total, 0);
+    $('#r-mediane-sous').textContent = `dans ${fmtAns(H)} · net d'impôts : ${fmtEuro(f.total.net, 0)}`;
+    $('#r-verse').textContent = fmtEuro(R.verses[H], 0);
+    $('#r-verse-sous').textContent = `capital + versements sur ${fmtAns(H)}`;
+    $('#r-gain').textContent = fmtEuro(gain, 0);
+    $('#r-gain').className = classeSigne(gain);
+    $('#r-gain-sous').textContent = R.verses[H] > 0 ? `${fmtPct(gain / R.verses[H], 0, true)} par rapport au versé (avant impôts)` : '';
+  }
+  if (resultatRisque) {
+    const d = resultatRisque.dd, a0 = resultatRisque.annees[0];
+    $('#r-dd').textContent = fmtPct(d.max, 1);
+    $('#r-dd').className = classeSigne(d.max);
+    $('#r-dd-sous').textContent = d.max < 0 ? `entre ${libelleMois(a0, d.iPic)} et ${libelleMois(a0, d.iCreux)}` : 'aucune baisse annuelle';
+  }
+}
+
+/* ============================ Sources des données ============================ */
+function rendreSources() {
+  const ids = MARCHE.ids;
+  const listeApprox = a => {
+    const ans = [...a.approx].sort((x, y) => x - y);
+    if (!ans.length) return 'aucune';
+    if (a.approx.size === Object.keys(a.r).length) return 'toutes';
+    const plages = []; let d = ans[0], p = ans[0];
+    for (const x of ans.slice(1).concat([null])) { if (x === p + 1) { p = x; continue; } plages.push(d === p ? `${d}` : `${d}-${p}`); d = p = x; }
+    return plages.join(', ');
+  };
+  $('#table-sources').innerHTML = `<thead><tr><th>Actif</th><th>Classe</th><th>Source</th><th>Période</th><th>Devise d'origine</th><th>Frais simulés</th><th>Années approximatives</th></tr></thead><tbody>` +
+    ids.map(id => { const a = MARCHE.actifs[id]; return `<tr>
+      <td><strong>${echap(a.nomCourt)}</strong><br><span class="note" style="margin:0">${echap(a.description || '')}</span></td>
+      <td>${echap(a.classe)}</td><td>${echap(a.source)}${a.approxNote ? `<br><span class="note">${echap(a.approxNote)}</span>` : ''}</td><td style="white-space:nowrap">${echap(a.periode)}</td>
+      <td>${a.devise === 'USD' ? 'USD → converti en €' : 'EUR'}</td>
+      <td>${fmtNombre(a.fraisAnnuels || 0, 2)} %/an${a.fraisEntree ? `<br>+ ${fmtNombre(a.fraisEntree, 0)} % à l'entrée` : ''}</td>
+      <td class="${a.approx.size ? 'approx' : ''}">${listeApprox(a)}</td></tr>`; }).join('') +
+    `<tr><td><strong>Taux EUR/USD</strong></td><td>Change</td><td>${echap(DONNEES_MARCHE.eurusd.source)}</td><td>1989-2025</td><td>—</td><td>—</td><td class="approx">${DONNEES_MARCHE.eurusd.approx.join(', ')}</td></tr>` +
+    `<tr><td><strong>Taux sans risque</strong></td><td>Monétaire</td><td>${echap(DONNEES_MARCHE.tauxSansRisque.source)}</td><td>1990-2025</td><td>EUR</td><td>—</td><td class="approx">1990-1998, 2025</td></tr></tbody>`;
+
+  const annees = anneesCommunes(ids);
+  $('#table-donnees').innerHTML = `<thead><tr><th>Année</th>${ids.map(id => `<th class="nombre">${echap(MARCHE.actifs[id].nomCourt)}</th>`).join('')}</tr></thead><tbody>` +
+    annees.map(an => `<tr><td><strong>${an}</strong></td>${ids.map(id => {
+      const a = MARCHE.actifs[id], x = a.r[an], ap = a.approx.has(an);
+      return `<td class="nombre ${ap ? 'approx' : ''} ${x < 0 ? 'negatif' : ''}">${ap ? '≈ ' : ''}${fmtNombre(x * 100, 1)}</td>`;
+    }).join('')}</tr>`).join('') + '</tbody>';
+}
+
+/* ===================== Contrôles du moteur sur cas simples ===================== */
+function executerControles() {
+  const controles = [];
+  const ajouter = (nom, attendu, obtenu, tol, format) => controles.push({ nom, attendu, obtenu, ok: Math.abs(attendu - obtenu) <= tol, format });
+  // Actif fictif à +5 %/an, sans frais
+  const cfgSimple = (capital, versement) => ({
+    positions: [{ actif: 0, poids: 1, env: 1, groupe: 1, estPEA: false, jumeau: -1, jumeauDe: -1, frais: 0, fraisEntree: 0 }],
+    capital, versementMensuel: versement, hausseVersement: 0, reequilibrage: true, plafondPEA: 150000,
+  });
+  const matrice = Array.from({ length: 10 }, () => [0.05]);
+  const seq = Array.from({ length: 10 }, (_, i) => i);
+  const f = precalculerFacteurs(matrice, cfgSimple(0, 0).positions);
+
+  const t1 = simulerTrajectoire(seq, cfgSimple(10000, 0), f, { twr: true });
+  ajouter('10 000 € à 5 %/an pendant 10 ans : 10 000 × 1,05¹⁰', 10000 * Math.pow(1.05, 10), t1.valeurs[10], 0.01, 'euro');
+  ajouter('Rendement annualisé de ce placement', 0.05, rendementAnnualise(Array.from(t1.twr)), 1e-9, 'pct');
+
+  const i = Math.pow(1.05, 1 / 12) - 1;
+  const t2 = simulerTrajectoire(seq, cfgSimple(0, 100), f, {});
+  ajouter('100 €/mois (début de mois) à 5 %/an, 10 ans : 100 × ((1+i)¹²⁰ − 1)/i × (1+i)', 100 * (Math.pow(1 + i, 120) - 1) / i * (1 + i), t2.valeurs[10], 0.01, 'euro');
+  ajouter('Total versé : 120 × 100 €', 12000, t2.verses[10], 1e-6, 'euro');
+
+  ajouter('Percentile 50 de 1, 2, …, 10', 5.5, percentile([3, 1, 2, 10, 9, 4, 8, 5, 7, 6], 0.5), 1e-12, 'nombre');
+  ajouter('Percentile 10 de 1, 2, …, 10 (interpolation linéaire)', 1.9, percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.1), 1e-12, 'nombre');
+  const dd = analyserDrawdown([100, 120, 90, 110, 125]);
+  ajouter('Perte maximale de 100 → 120 → 90 → 110 → 125 : 90/120 − 1', -0.25, dd.max, 1e-12, 'pct');
+  ajouter('… retour au sommet au 5e point', 4, dd.iRetour, 0, 'nombre');
+  ajouter('Rendement annualisé de +10 % puis −10 % : √0,99 − 1', Math.sqrt(0.99) - 1, rendementAnnualise([0.1, -0.1]), 1e-12, 'pct');
+
+  const P = PARAMETRES_FISCAUX;
+  const fAV = calculerFiscalite({ PEA: { valeur: 0, verse: 0 }, CTO: { valeur: 0, verse: 0 }, AV: { valeur: 70000, verse: 50000 } }, { dureePEA: 0, dureeAV: 10, situation: 'celibataire' }, P);
+  ajouter(`Assurance-vie 10 ans, 50 000 € versés → 70 000 € : (20 000 − ${P.assuranceVie.abattementCelibataire}) × ${fmtPct(P.assuranceVie.tauxReduitApres8Ans)} + 20 000 × ${fmtPct(P.prelevementsSociauxAssuranceVie)}`,
+    (20000 - P.assuranceVie.abattementCelibataire) * P.assuranceVie.tauxReduitApres8Ans + 20000 * P.prelevementsSociauxAssuranceVie, fAV.total.impot, 0.005, 'euro');
+  const fPEA = calculerFiscalite({ PEA: { valeur: 30000, verse: 20000 }, CTO: { valeur: 0, verse: 0 }, AV: { valeur: 0, verse: 0 } }, { dureePEA: 3, dureeAV: 0, situation: 'celibataire' }, P);
+  ajouter(`PEA de 3 ans, gain de 10 000 € : 10 000 × (${fmtPct(P.pfuImpotRevenu)} + ${fmtPct(P.prelevementsSociaux)})`, 10000 * (P.pfuImpotRevenu + P.prelevementsSociaux), fPEA.total.impot, 0.005, 'euro');
+  const fPEA6 = calculerFiscalite({ PEA: { valeur: 30000, verse: 20000 }, CTO: { valeur: 0, verse: 0 }, AV: { valeur: 0, verse: 0 } }, { dureePEA: 6, dureeAV: 0, situation: 'celibataire' }, P);
+  ajouter(`PEA de 6 ans, gain de 10 000 € : 10 000 × ${fmtPct(P.prelevementsSociaux)}`, 10000 * P.prelevementsSociaux, fPEA6.total.impot, 0.005, 'euro');
+  return controles;
+}
+
+function rendreControles() {
+  const c = executerControles();
+  const fmt = (x, t) => t === 'euro' ? fmtEuro(x, 2) : t === 'pct' ? fmtPct(x, 4) : fmtNombre(x, 2);
+  $('#table-controles').innerHTML = '<thead><tr><th>Cas testé</th><th class="nombre">Attendu (calcul à la main)</th><th class="nombre">Obtenu (moteur)</th><th>Résultat</th></tr></thead><tbody>' +
+    c.map(x => `<tr><td>${echap(x.nom)}</td><td class="nombre">${fmt(x.attendu, x.format)}</td><td class="nombre">${fmt(x.obtenu, x.format)}</td><td class="${x.ok ? 'ok' : 'ko'}">${x.ok ? '✓ conforme' : '✗ écart'}</td></tr>`).join('') + '</tbody>';
+  if (c.some(x => !x.ok)) console.error('Contrôles de calcul en échec', c.filter(x => !x.ok));
+  return c;
+}
+
+/* ================================ Démarrage ================================ */
+function demarrer() {
+  installerBulles();
+  installerOnglets();
+  installerChamps();
+  installerLignes();
+  synchroniserChamps();
+  rendreLignes();
+  rendreSources();
+  rendreControles();
+  recalculer('tout');
+}
+demarrer();
+</script>
+</body>
+</html>
